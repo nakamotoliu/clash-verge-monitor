@@ -305,8 +305,9 @@ readonly SWITCH_WAIT=3        # 切换等待时间
 readonly STABILIZE_WAIT=5     # 稳定等待时间
 
 # Telegram 通知
-readonly TELEGRAM_ACCOUNT="alerts"
-readonly TELEGRAM_TARGET="1625845749"
+# 建议通过环境变量注入（未配置 TELEGRAM_TARGET 则自动跳过通知）
+TELEGRAM_ACCOUNT="${TELEGRAM_ACCOUNT:-default}"
+TELEGRAM_TARGET="${TELEGRAM_TARGET:-}"
 ```
 
 ## 工作原理
