@@ -1,0 +1,19 @@
+{
+  "selector": "手动选择",
+  "intervals": {
+    "rebalanceCheckInterval": 6,
+    "minNodeDwellSeconds": 1800
+  },
+  "thresholds": {
+    "failoverImprovementMs": 50,
+    "rebalanceImprovementMs": 120
+  },
+  "timers": {
+    "timeoutBasicSeconds": 5,
+    "timeoutApiSeconds": 10
+  },
+  "filters": {
+    "excludeRegex": "(hong.*kong|香港|^Expire:|^到期:|剩余流量|流量重置)",
+    "includeRegex": ""
+  }
+}

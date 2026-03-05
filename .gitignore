@@ -1,0 +1,9 @@
+# Runtime artifacts
+logs/
+data/
+
+# macOS
+.DS_Store
+
+# Local overrides
+config/*.local.json
