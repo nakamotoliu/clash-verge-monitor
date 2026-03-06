@@ -31,6 +31,11 @@ NODE_STATE_FILE="$STATE_DIR/node_state.json"
 TELEGRAM_ACCOUNT="${TELEGRAM_ACCOUNT:-default}"
 TELEGRAM_TARGET="${TELEGRAM_TARGET:-}"
 
+# 邮件告警配置（默认开启）
+MAIL_TO="${MAIL_TO:-}"
+MAIL_SUBJECT_PREFIX="${MAIL_SUBJECT_PREFIX:-[Clash HealthCheck]}"
+MAIL_SENDER_SCRIPT="${MAIL_SENDER_SCRIPT:-$HOME/clawd/projects/clash-verge-monitor/scripts/send_email_126.py}"
+
 # UI 配置文件（未来可由 Clash 客户端 UI 写入）
 CONFIG_FILE="${CONFIG_FILE:-$PROJECT_ROOT/config/ui_config.json}"
 
@@ -150,7 +155,7 @@ send_telegram() {
     fi
 
     if [[ -z "$TELEGRAM_TARGET" ]]; then
-        log "INFO" "未配置 TELEGRAM_TARGET，跳过通知: $message"
+        log "INFO" "未配置 TELEGRAM_TARGET，跳过 Telegram: $message"
         return 0
     fi
 
@@ -159,6 +164,37 @@ send_telegram() {
       --account "$TELEGRAM_ACCOUNT" \
       --target "$TELEGRAM_TARGET" \
       --message "$message" 2>&1 | tee -a "$LOG_FILE" || true
+}
+
+send_email() {
+    local subject="$1"
+    local body="$2"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log "INFO" "[DRY-RUN] 跳过 Email: $subject"
+        return 0
+    fi
+
+    if [[ -z "$MAIL_TO" ]]; then
+        log "INFO" "未配置 MAIL_TO，跳过 Email: $subject"
+        return 0
+    fi
+
+    if [[ ! -f "$MAIL_SENDER_SCRIPT" ]]; then
+        log "WARN" "邮件脚本不存在，跳过 Email: $MAIL_SENDER_SCRIPT"
+        return 0
+    fi
+
+    python3 "$MAIL_SENDER_SCRIPT" "$MAIL_TO" "$subject" "$body" 2>&1 | tee -a "$LOG_FILE" || true
+}
+
+send_alert() {
+    local title="$1"
+    local message="$2"
+    local subject="${MAIL_SUBJECT_PREFIX} ${title}"
+
+    send_telegram "$message"
+    send_email "$subject" "$message"
 }
 
 # ==================== 状态管理 ====================
@@ -217,7 +253,7 @@ record_global_failure() {
     if [[ $failures -ge $MAX_GLOBAL_FAILURES ]]; then
         echo "{\"failures\":$failures,\"opened_at\":$now}" > "$CIRCUIT_BREAKER_FILE"
         log "ERROR" "🔴 触发熔断：连续 $failures 次全局故障"
-        send_telegram "🔴 VPN 熔断触发\n连续 $failures 次全局故障\n冷却 ${CIRCUIT_BREAKER_COOLDOWN}s"
+        send_alert "熔断告警" "🔴 VPN 熔断触发\n连续 $failures 次全局故障\n冷却 ${CIRCUIT_BREAKER_COOLDOWN}s"
     else
         echo "{\"failures\":$failures,\"opened_at\":0}" > "$CIRCUIT_BREAKER_FILE"
         log "WARN" "全局故障计数: $failures/$MAX_GLOBAL_FAILURES"
@@ -481,7 +517,7 @@ maybe_rebalance_when_healthy() {
     # 满足条件才切（较少发生）
     log "WARN" "⚖️ 触发重平衡切换: $current_node(${current_delay}ms) -> $best_node(${best_delay}ms)"
     if switch_node "$best_node"; then
-        send_telegram "⚖️ 节点重平衡\n$current_node(${current_delay}ms) → $best_node(${best_delay}ms)\n改善 ${improvement}ms"
+        send_alert "节点重平衡" "⚖️ 节点重平衡\n$current_node(${current_delay}ms) → $best_node(${best_delay}ms)\n改善 ${improvement}ms"
     fi
 }
 
@@ -494,7 +530,7 @@ smart_switch() {
     [[ "$current_delay" -lt 0 ]] && current_delay=99999
 
     log "WARN" "⚠️ 当前节点 [$current_node] 故障，开始智能切换..."
-    send_telegram "⚠️ VPN 节点故障\n当前: $current_node\n开始智能切换（含延迟评分）"
+    send_alert "节点故障" "⚠️ VPN 节点故障\n当前: $current_node\n开始智能切换（含延迟评分）"
 
     cleanup_quarantine
     quarantine_node "$current_node"
@@ -535,7 +571,7 @@ smart_switch() {
         if [[ $fault_type -eq 0 ]]; then
             log "INFO" "✅ 切换成功: $best_node"
             reset_failure_count
-            send_telegram "✅ VPN 恢复\n新节点: $best_node\n延迟: ${best_delay}ms\n尝试次数: $attempt"
+            send_alert "恢复通知" "✅ VPN 恢复\n新节点: $best_node\n延迟: ${best_delay}ms\n尝试次数: $attempt"
             return 0
         fi
 
@@ -551,7 +587,7 @@ smart_switch() {
 
     log "ERROR" "❌ 未找到可用节点（已尝试 $attempt 个）"
     record_global_failure
-    send_telegram "🚨 节点切换失败\n尝试 $attempt 个候选仍不可用"
+    send_alert "切换失败" "🚨 节点切换失败\n尝试 $attempt 个候选仍不可用"
     return 1
 }
 
@@ -622,17 +658,17 @@ main() {
         2)
             log "WARN" "⚠️ Cloudflare 全局故障（不切节点）"
             record_global_failure
-            send_telegram "⚠️ 疑似 Cloudflare 故障\n当前节点: $current_node\n已暂停切换，等待恢复"
+            send_alert "Cloudflare 异常" "⚠️ 疑似 Cloudflare 故障\n当前节点: $current_node\n已暂停切换，等待恢复"
             ;;
         3)
             log "WARN" "⚠️ 上游 API 故障（不切节点）"
             record_global_failure
-            send_telegram "⚠️ 疑似上游 API 故障\nOpenAI/Anthropic 同时异常\n已暂停切换"
+            send_alert "上游API异常" "⚠️ 疑似上游 API 故障\nOpenAI/Anthropic 同时异常\n已暂停切换"
             ;;
         4)
             log "WARN" "⚠️ 本地网络故障（不切节点）"
             record_global_failure
-            send_telegram "⚠️ 本地网络异常\n请检查本机网络/路由"
+            send_alert "本地网络异常" "⚠️ 本地网络异常\n请检查本机网络/路由"
             ;;
     esac
 }
