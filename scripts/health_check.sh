@@ -59,6 +59,12 @@ LATENCY_REBALANCE_IMPROVEMENT_MS=120 # 正常重平衡：至少快 120ms 才切
 MIN_NODE_DWELL_SECONDS=1800          # 最小驻留 30 分钟，避免频繁切换
 REBALANCE_CHECK_INTERVAL=6           # 每 N 次健康轮询才做一次重平衡检查
 
+# 响应时间健康阈值（毫秒）
+# 超过此阈值视为"慢速降级"，连续多次触发切换
+SLOW_THRESHOLD_BASIC_MS=3000         # 基础网络/Google：3 秒算慢
+SLOW_THRESHOLD_API_MS=5000           # 大模型 API：5 秒算慢
+SLOW_CONSECUTIVE_LIMIT=3             # 连续 N 次慢速才触发切换（防偶发抖动）
+
 # canary URLs
 CANARY_BASIC="https://www.baidu.com"
 CANARY_CLOUDFLARE="https://1.1.1.1/cdn-cgi/trace"
@@ -117,6 +123,9 @@ load_ui_config() {
 
     v=$(jq -r '.thresholds.failoverImprovementMs // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && LATENCY_FAILOVER_IMPROVEMENT_MS="$v"
     v=$(jq -r '.thresholds.rebalanceImprovementMs // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && LATENCY_REBALANCE_IMPROVEMENT_MS="$v"
+    v=$(jq -r '.thresholds.slowBasicMs // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && SLOW_THRESHOLD_BASIC_MS="$v"
+    v=$(jq -r '.thresholds.slowApiMs // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && SLOW_THRESHOLD_API_MS="$v"
+    v=$(jq -r '.thresholds.slowConsecutiveLimit // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && SLOW_CONSECUTIVE_LIMIT="$v"
 
     v=$(jq -r '.timers.timeoutBasicSeconds // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && TIMEOUT_BASIC="$v"
     v=$(jq -r '.timers.timeoutApiSeconds // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && TIMEOUT_API="$v"
@@ -303,7 +312,7 @@ _init_daily_stats() {
     f=$(_daily_stats_file)
     [[ -f "$f" ]] && return 0
     cat > "$f" <<'STATS'
-{"date":"'$(date '+%Y-%m-%d')'","checks":0,"healthy":0,"faults":{"vpn":0,"cf":0,"api":0,"local":0},"switches":0,"circuit_breaks":0}
+{"date":"'$(date '+%Y-%m-%d')'","checks":0,"healthy":0,"faults":{"vpn":0,"cf":0,"api":0,"local":0,"slow":0},"switches":0,"circuit_breaks":0}
 STATS
     # fix the date inside the file
     local today
@@ -380,13 +389,14 @@ show_stats() {
         cf_f=$(jq -r '.faults.cf // 0' "$sf")
         api_f=$(jq -r '.faults.api // 0' "$sf")
         local_f=$(jq -r '.faults.local // 0' "$sf")
+        slow_f=$(jq -r '.faults.slow // 0' "$sf")
         switches=$(jq -r '.switches // 0' "$sf")
         cbs=$(jq -r '.circuit_breaks // 0' "$sf")
-        local total_faults=$((vpn_f + cf_f + api_f + local_f))
+        local total_faults=$((vpn_f + cf_f + api_f + local_f + slow_f))
         local pct=0
         (( checks > 0 )) && pct=$(( healthy * 100 / checks ))
         echo "   检查总数: $checks    健康: $healthy    故障: $total_faults    可用率: ${pct}%"
-        echo "   故障明细: VPN=$vpn_f  CF=$cf_f  API=$api_f  本地=$local_f"
+        echo "   故障明细: VPN=$vpn_f  CF=$cf_f  API=$api_f  本地=$local_f  慢速=$slow_f"
         echo "   节点切换: $switches    熔断: $cbs"
     else
         echo "   (暂无数据)"
@@ -404,12 +414,13 @@ show_stats() {
         cf_f=$(jq -r '.faults.cf // 0' "$yf")
         api_f=$(jq -r '.faults.api // 0' "$yf")
         local_f=$(jq -r '.faults.local // 0' "$yf")
+        slow_f=$(jq -r '.faults.slow // 0' "$yf")
         switches=$(jq -r '.switches // 0' "$yf")
-        local total_faults=$((vpn_f + cf_f + api_f + local_f))
+        local total_faults=$((vpn_f + cf_f + api_f + local_f + slow_f))
         local pct=0
         (( checks > 0 )) && pct=$(( healthy * 100 / checks ))
         echo "   检查总数: $checks    健康: $healthy    故障: $total_faults    可用率: ${pct}%"
-        echo "   故障明细: VPN=$vpn_f  CF=$cf_f  API=$api_f  本地=$local_f"
+        echo "   故障明细: VPN=$vpn_f  CF=$cf_f  API=$api_f  本地=$local_f  慢速=$slow_f"
         echo "   节点切换: $switches"
     else
         echo "   (无数据)"
@@ -611,13 +622,53 @@ get_node_delay_ms() {
 }
 
 # ==================== 故障分类 ====================
-check_url() {
-    local url="$1" timeout="$2" http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$timeout" "$url" 2>/dev/null || echo "000")
+
+# check_url_timed: 检测 URL 可达性 + 响应时间
+# 用法: check_url_timed <url> <timeout>
+# 输出: "<http_code> <time_ms>" 到 stdout
+# 返回: 0=可达, 1=不可达
+check_url_timed() {
+    local url="$1" timeout="$2"
+    local result
+    result=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" --max-time "$timeout" "$url" 2>/dev/null || echo "000 0")
+    local http_code time_s
+    http_code=$(echo "$result" | awk '{print $1}')
+    time_s=$(echo "$result" | awk '{print $2}')
+
+    # 转换为毫秒（兼容无小数的情况）
+    local time_ms
+    time_ms=$(echo "$time_s" | awk '{printf "%d", $1 * 1000}')
+
+    echo "$http_code $time_ms"
+
     if [[ "$http_code" -ge "$HTTP_CODE_MIN" && "$http_code" -le "$HTTP_CODE_MAX" ]]; then
         return 0
     fi
     return 1
+}
+
+# 兼容旧接口
+check_url() {
+    local url="$1" timeout="$2"
+    local result
+    result=$(check_url_timed "$url" "$timeout")
+    local http_code
+    http_code=$(echo "$result" | awk '{print $1}')
+    if [[ "$http_code" -ge "$HTTP_CODE_MIN" && "$http_code" -le "$HTTP_CODE_MAX" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# 慢速计数器（状态文件）
+_slow_count_file() { echo "$STATE_DIR/slow_count"; }
+
+_get_slow_count() {
+    cat "$(_slow_count_file)" 2>/dev/null || echo 0
+}
+
+_set_slow_count() {
+    echo "$1" > "$(_slow_count_file)"
 }
 
 # 0 正常
@@ -625,43 +676,101 @@ check_url() {
 # 2 Cloudflare 全局故障（不切）
 # 3 上游 API 故障（不切）
 # 4 本地网络故障（不切）
+# 5 慢速降级（可切换）— 新增
 classify_fault() {
     local basic_ok=false cloudflare_ok=false google_ok=false telegram_ok=false openai_ok=false anthropic_ok=false
+    local basic_ms=0 cloudflare_ms=0 google_ms=0 telegram_ms=0 openai_ms=0 anthropic_ms=0
+    local result code ms
 
-    check_url "$CANARY_BASIC" "$TIMEOUT_BASIC" && basic_ok=true
-    check_url "$CANARY_CLOUDFLARE" "$TIMEOUT_BASIC" && cloudflare_ok=true
-    check_url "$CANARY_GOOGLE" "$TIMEOUT_BASIC" && google_ok=true
-    check_url "$CANARY_TELEGRAM" "$TIMEOUT_API" && telegram_ok=true
-    check_url "https://api.openai.com/v1/models" "$TIMEOUT_API" && openai_ok=true
-    check_url "https://api.anthropic.com" "$TIMEOUT_API" && anthropic_ok=true
+    result=$(check_url_timed "$CANARY_BASIC" "$TIMEOUT_BASIC") && basic_ok=true || true
+    code=$(echo "$result" | awk '{print $1}'); basic_ms=$(echo "$result" | awk '{print $2}')
+    [[ "$code" -ge "$HTTP_CODE_MIN" && "$code" -le "$HTTP_CODE_MAX" ]] && basic_ok=true
 
-    [[ "$basic_ok" == true ]] && log "DEBUG" "✅ 基础网络正常" || log "DEBUG" "❌ 基础网络异常"
-    [[ "$cloudflare_ok" == true ]] && log "DEBUG" "✅ Cloudflare 正常" || log "DEBUG" "❌ Cloudflare 异常"
-    [[ "$google_ok" == true ]] && log "DEBUG" "✅ Google 正常" || log "DEBUG" "❌ Google 异常"
-    [[ "$telegram_ok" == true ]] && log "DEBUG" "✅ Telegram 正常" || log "DEBUG" "❌ Telegram 异常"
-    [[ "$openai_ok" == true ]] && log "DEBUG" "✅ OpenAI 正常" || log "DEBUG" "❌ OpenAI 异常"
-    [[ "$anthropic_ok" == true ]] && log "DEBUG" "✅ Anthropic 正常" || log "DEBUG" "❌ Anthropic 异常"
+    result=$(check_url_timed "$CANARY_CLOUDFLARE" "$TIMEOUT_BASIC") && cloudflare_ok=true || true
+    code=$(echo "$result" | awk '{print $1}'); cloudflare_ms=$(echo "$result" | awk '{print $2}')
+    [[ "$code" -ge "$HTTP_CODE_MIN" && "$code" -le "$HTTP_CODE_MAX" ]] && cloudflare_ok=true
 
+    result=$(check_url_timed "$CANARY_GOOGLE" "$TIMEOUT_BASIC") && google_ok=true || true
+    code=$(echo "$result" | awk '{print $1}'); google_ms=$(echo "$result" | awk '{print $2}')
+    [[ "$code" -ge "$HTTP_CODE_MIN" && "$code" -le "$HTTP_CODE_MAX" ]] && google_ok=true
+
+    result=$(check_url_timed "$CANARY_TELEGRAM" "$TIMEOUT_API") && telegram_ok=true || true
+    code=$(echo "$result" | awk '{print $1}'); telegram_ms=$(echo "$result" | awk '{print $2}')
+    [[ "$code" -ge "$HTTP_CODE_MIN" && "$code" -le "$HTTP_CODE_MAX" ]] && telegram_ok=true
+
+    result=$(check_url_timed "https://api.openai.com/v1/models" "$TIMEOUT_API") && openai_ok=true || true
+    code=$(echo "$result" | awk '{print $1}'); openai_ms=$(echo "$result" | awk '{print $2}')
+    [[ "$code" -ge "$HTTP_CODE_MIN" && "$code" -le "$HTTP_CODE_MAX" ]] && openai_ok=true
+
+    result=$(check_url_timed "https://api.anthropic.com" "$TIMEOUT_API") && anthropic_ok=true || true
+    code=$(echo "$result" | awk '{print $1}'); anthropic_ms=$(echo "$result" | awk '{print $2}')
+    [[ "$code" -ge "$HTTP_CODE_MIN" && "$code" -le "$HTTP_CODE_MAX" ]] && anthropic_ok=true
+
+    # 日志输出（带响应时间）
+    [[ "$basic_ok" == true ]] && log "DEBUG" "✅ 基础网络正常 (${basic_ms}ms)" || log "DEBUG" "❌ 基础网络异常"
+    [[ "$cloudflare_ok" == true ]] && log "DEBUG" "✅ Cloudflare 正常 (${cloudflare_ms}ms)" || log "DEBUG" "❌ Cloudflare 异常"
+    [[ "$google_ok" == true ]] && log "DEBUG" "✅ Google 正常 (${google_ms}ms)" || log "DEBUG" "❌ Google 异常"
+    [[ "$telegram_ok" == true ]] && log "DEBUG" "✅ Telegram 正常 (${telegram_ms}ms)" || log "DEBUG" "❌ Telegram 异常"
+    [[ "$openai_ok" == true ]] && log "DEBUG" "✅ OpenAI 正常 (${openai_ms}ms)" || log "DEBUG" "❌ OpenAI 异常"
+    [[ "$anthropic_ok" == true ]] && log "DEBUG" "✅ Anthropic 正常 (${anthropic_ms}ms)" || log "DEBUG" "❌ Anthropic 异常"
+
+    # 先判断不可达
     if [[ "$google_ok" == true && "$telegram_ok" == true && "$openai_ok" == true && "$anthropic_ok" == true ]]; then
+        # 全部可达，再检查是否慢速
+        local is_slow=false
+        local slow_targets=""
+
+        if [[ "$google_ok" == true ]] && (( google_ms > SLOW_THRESHOLD_BASIC_MS )); then
+            is_slow=true; slow_targets+="Google(${google_ms}ms) "
+        fi
+        if [[ "$openai_ok" == true ]] && (( openai_ms > SLOW_THRESHOLD_API_MS )); then
+            is_slow=true; slow_targets+="OpenAI(${openai_ms}ms) "
+        fi
+        if [[ "$anthropic_ok" == true ]] && (( anthropic_ms > SLOW_THRESHOLD_API_MS )); then
+            is_slow=true; slow_targets+="Anthropic(${anthropic_ms}ms) "
+        fi
+
+        if [[ "$is_slow" == true ]]; then
+            local count
+            count=$(_get_slow_count)
+            count=$((count + 1))
+            _set_slow_count "$count"
+            log "WARN" "🐌 慢速检测: ${slow_targets}(连续 ${count}/${SLOW_CONSECUTIVE_LIMIT})"
+
+            if (( count >= SLOW_CONSECUTIVE_LIMIT )); then
+                log "WARN" "🐌 连续 ${count} 次慢速，触发降级切换"
+                _set_slow_count 0
+                return 5
+            fi
+        else
+            # 速度正常，重置计数器
+            _set_slow_count 0
+        fi
+
         return 0
     fi
 
     if [[ "$basic_ok" == false ]]; then
+        _set_slow_count 0
         return 4
     fi
 
     if [[ "$google_ok" == false || "$telegram_ok" == false ]]; then
+        _set_slow_count 0
         return 1
     fi
 
     if [[ "$cloudflare_ok" == false && "$openai_ok" == false ]]; then
+        _set_slow_count 0
         return 2
     fi
 
     if [[ "$google_ok" == true && "$telegram_ok" == true && "$openai_ok" == false && "$anthropic_ok" == false ]]; then
+        _set_slow_count 0
         return 3
     fi
 
+    _set_slow_count 0
     return 1
 }
 
@@ -919,6 +1028,17 @@ main() {
             _bump_daily_fault "local"
             record_global_failure
             send_alert "本地网络异常" "⚠️ 本地网络异常\n请检查本机网络/路由"
+            ;;
+        5)
+            log "WARN" "🐌 慢速降级，尝试切换更快节点"
+            _bump_daily_fault "slow"
+            if smart_switch "$current_node"; then
+                _bump_daily_stat "switches"
+                log "INFO" "========== 完成：慢速切换成功 =========="
+                exit 0
+            else
+                log "WARN" "========== 完成：慢速切换失败（保持当前节点） =========="
+            fi
             ;;
     esac
 }
