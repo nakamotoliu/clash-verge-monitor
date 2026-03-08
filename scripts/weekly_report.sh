@@ -160,13 +160,13 @@ send_report() {
         return 0
     fi
 
-    # 用 Gmail API 发送
-    local send_script="$HOME/clawd/projects/gmail-tools/src/send_gmail_api.py"
+    # 用 126 SMTP 发送
+    local send_script="$PROJECT_ROOT/scripts/send_email_126.py"
     if [[ -f "$send_script" ]]; then
-        python3 "$send_script" "$REPORT_TO" "$subject" "$report"
-        echo "✅ 周报已发送到 $REPORT_TO"
+        FROM_EMAIL="edmjason@126.com" python3 "$send_script" "$REPORT_TO" "$subject" "$report"
+        echo "✅ 周报已发送到 $REPORT_TO (via edmjason@126.com)"
     else
-        echo "❌ Gmail 发送脚本不存在: $send_script"
+        echo "❌ 邮件发送脚本不存在: $send_script"
         exit 1
     fi
 }
