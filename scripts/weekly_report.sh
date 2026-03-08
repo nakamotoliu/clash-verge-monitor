@@ -160,13 +160,12 @@ send_report() {
         return 0
     fi
 
-    # 用 126 SMTP 发送
-    local send_script="$PROJECT_ROOT/scripts/send_email_126.py"
+    # 通用邮件工具发送
+    local send_script="$HOME/clawd/scripts/send_email.sh"
     if [[ -f "$send_script" ]]; then
-        FROM_EMAIL="edmjason@126.com" python3 "$send_script" "$REPORT_TO" "$subject" "$report"
-        echo "✅ 周报已发送到 $REPORT_TO (via edmjason@126.com)"
+        bash "$send_script" "$REPORT_TO" "$subject" "$report"
     else
-        echo "❌ 邮件发送脚本不存在: $send_script"
+        echo "❌ 通用邮件工具不存在: $send_script"
         exit 1
     fi
 }
