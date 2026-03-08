@@ -7,3 +7,4 @@ data/
 
 # Local overrides
 config/*.local.json
+__pycache__/
