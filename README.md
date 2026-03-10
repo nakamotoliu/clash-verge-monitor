@@ -1,562 +1,354 @@
-# Clash Verge 自动监控与切换
+# Clash Verge Monitor
 
-## 项目简介
-自动检测 AI 大模型（OpenAI/Claude/Google）可访问性，VPN 节点故障时自动切换到可用节点。
+Clash Verge / verge-mihomo 节点健康检查与自动切换脚本，面向 **macOS + Clash Unix socket + AI 工作流**。
 
----
-
-## 🚀 v2 版本（推荐使用）
-
-### v2 新增特性
-| 特性 | 说明 |
-|------|------|
-| **故障分类** | 区分本地网络/VPN节点/Cloudflare/上游API故障 |
-| **熔断机制** | 连续3次全局故障后进入30分钟冷却，避免无效切换 |
-| **尝试预算** | 单次最多切换5个节点，防止轮询所有节点 |
-| **节点隔离** | 失败节点30分钟内不再尝试 |
-| **节点名修复** | 正确处理带空格/emoji的节点名 |
-| **延迟评分** | 候选节点先测延迟，再按综合分排序 |
-| **防抖切换** | 最小驻留时间+改善阈值，避免“追最低延迟”导致频繁切换 |
-
-### v2.2（进行中）新增：UI 配置化双引擎
-- 双引擎并行：故障切换 + 定时重平衡
-- 参数由 `config/ui_config.json` 读取（后续可由 UI 面板写入）
-- 节点过滤支持 `excludeRegex/includeRegex`
-- 默认过滤订阅信息行：`Expire/到期/剩余流量/流量重置`
-
-### v2.1 快速开始
-```bash
-# 1. 测试运行（不切换节点）
-./scripts/health_check.sh --dry-run
-
-# 2. 实际运行
-./scripts/health_check.sh
-
-# 3. 重置熔断状态
-./scripts/health_check.sh --reset
-
-# 4. 查看状态文件
-cat <project-root>/data/state/circuit_breaker.json  # 熔断状态
-cat <project-root>/data/state/quarantine.json       # 隔离节点
-```
-
-### v2 故障分类逻辑
-```
-基础网络(baidu) ──┬── ❌ ──> 本地网络故障（不切换）
-                  │
-                  └── ✅ ──> Google ──┬── ❌ ──> VPN/节点故障（切换）
-                                      │
-                                      └── ✅ ──> Cloudflare ──┬── ❌ + API❌ ──> CF全局故障（不切换，熔断）
-                                                              │
-                                                              └── ✅ ──> API ──┬── ❌ ──> 上游故障（不切换，熔断）
-                                                                               │
-                                                                               └── ✅ ──> 正常
-```
+它不是通用 VPN 教程，而是一个偏实战的故障切换项目：
+- 检查基础网络、Google、Telegram、OpenAI、Anthropic 可达性
+- 检查响应时间，识别“慢但没死”的降级情况
+- 读取 **OpenClaw `gateway.err.log`**，识别真实的 **LLM timeout**
+- 在满足条件时自动切换到更优节点
+- 带隔离、冷却、熔断、防抖、日志和日报统计
 
 ---
 
-## ⚡ 快速开始（兼容命令）
+## 这项目现在解决什么问题
 
-```bash
-# 1. 测试运行（不切换节点）
-cd <project-root>
-./scripts/health_check.sh --dry-run
+过去只靠轻量连通性探测时，会出现一种很烦的错位：
 
-# 2. 实际运行（会切换节点）
-./scripts/health_check.sh
+- `api.openai.com` 看起来能通
+- `api.anthropic.com` 看起来也能通
+- 但 OpenClaw 在真实模型请求里持续报：
+  - `LLM request timed out.`
+  - `FailoverError: LLM request timed out.`
+  - `All models failed ... timeout`
 
-# 3. 设置定时任务（每 5 分钟）
-openclaw cron add \
-  --name "Clash 健康检查" \
-  --schedule '*/5 * * * *' \
-  --isolated \
-  --command "bash <project-root>/scripts/health_check.sh"
+结果就是：**监控说健康，agent 实际已经半死不活。**
 
-# 4. 验证定时任务
-openclaw cron list | grep "Clash"
+现在这项目会同时看：
+1. 基础探测结果
+2. OpenClaw 真实错误日志
 
-# 5. 查看日志
-tail -f <project-root>/logs/clash_health.log
-```
+也就是不只看“路通不通”，还看“车是不是已经在路上熄火了”。
 
 ---
 
-## 核心特性
-- ✅ 实时健康检查（Google/OpenAI/Anthropic）
-- ✅ 自动切换节点（排除 Hong Kong 节点）
-- ✅ 并发保护（避免重复执行）
-- ✅ Telegram 通知
-- ✅ 完整日志记录
-- ✅ Dry-run 测试模式
+## 当前核心能力
 
-## 技术栈
-- **Clash Verge** - macOS VPN 客户端
-- **Unix Socket API** - 控制 Clash 节点
-- **Bash 脚本** - 健康检查与切换逻辑
+### 1. 故障分类
+脚本会区分：
+- 本地网络故障
+- 节点 / VPN 故障
+- Cloudflare 类全局故障
+- 上游 API 故障
+- 慢速降级
+- OpenClaw LLM timeout 驱动的故障
 
-## 文件结构
-```
+### 2. 智能切换
+不是盲切，会综合：
+- 候选节点延迟
+- 当前节点延迟
+- 最小改善阈值
+- 节点隔离状态
+- 最大尝试次数
+
+### 3. 防抖 / 保护
+- 熔断：连续全局故障后进入冷却
+- 隔离：失败节点暂时不再尝试
+- 驻留时间：避免频繁来回切
+- LLM timeout 冷却：避免同一波日志反复触发切换
+- 并发锁：避免重入执行
+
+### 4. LLM timeout 感知
+会读取：
+- `~/.openclaw/logs/gateway.err.log`
+
+识别这些模式：
+- `LLM request timed out.`
+- `FailoverError: LLM request timed out.`
+- `All models failed .* timeout`
+
+默认策略：
+- 最近 `600` 秒窗口
+- `>= 4` 次 timeout
+- 冷却 `1800` 秒
+- 扫描日志尾部 `5000` 行
+
+并且现在会：
+- 记录最近事件 key 做去重
+- 将 `llm_timeout` 单独计入统计
+- 在 `llm_timeout_trigger` 切换后做一次 **复验**，避免“切了但模型照样超时”还误判成功
+
+---
+
+## 项目结构
+
+```text
 clash-verge-monitor/
 ├── README.md
-├── scripts/
-│   └── health_check.sh        # 主脚本
+├── CHANGELOG.md
+├── config/
+│   └── ui_config.json
 ├── logs/
-│   └── clash_health.log       # 运行日志
-└── config/
-    └── (预留配置文件)
+│   └── clash_health.log
+└── scripts/
+    ├── health_check.sh
+    ├── weekly_report.sh
+    └── send_email_126.py
 ```
 
-## 使用方法
+运行期状态文件在：
 
-### 🧪 测试步骤（首次使用必做）
-
-#### 1. Dry-run 测试（不切换节点）
-```bash
-cd <project-root>
-./scripts/health_check.sh --dry-run
-```
-
-**预期输出：**
-```
-[2026-03-02 10:09:05] [INFO] ========== 开始健康检查 ==========
-[2026-03-02 10:09:05] [INFO] ⚠️ DRY-RUN 模式
-[2026-03-02 10:09:05] [INFO] 当前节点: 🇺🇸 美国 01
-[2026-03-02 10:09:06] [DEBUG] ✅ Google 可达 (HTTP 200)
-[2026-03-02 10:09:07] [DEBUG] ✅ OpenAI API 可达 (HTTP 401)
-[2026-03-02 10:09:08] [DEBUG] ✅ Anthropic API 可达 (HTTP 404)
-[2026-03-02 10:09:08] [INFO] ✅ 所有 AI 服务可访问
-[2026-03-02 10:09:08] [INFO] ========== 检查完成：正常 ==========
-```
-
-#### 2. 实际运行测试（会切换节点）
-```bash
-cd <project-root>
-./scripts/health_check.sh
-```
-
-**检查结果：**
-```bash
-# 查看日志
-tail -20 <project-root>/logs/clash_health.log
-
-# 查看当前节点
-curl --unix-socket /tmp/verge/verge-mihomo.sock \
-  http://localhost/proxies/手动选择 -s | jq '.now'
-```
-
-#### 3. 模拟故障测试
-```bash
-# 临时关闭 VPN，测试自动切换
-# 然后运行脚本，应该会自动切换节点
-
-./scripts/health_check.sh
-
-# 检查是否收到 Telegram 通知
-# 检查日志是否有切换记录
-tail -50 <project-root>/logs/clash_health.log | grep "切换"
+```text
+data/state/
+├── circuit_breaker.json
+├── quarantine.json
+├── node_state.json
+├── llm_timeout_state.json
+└── stats_YYYY-MM-DD.json
 ```
 
 ---
 
-### 🚀 部署定时任务
+## 运行前提
 
-#### 方式 1：OpenClaw Cron（推荐）
+- macOS
+- Clash Verge / verge-mihomo 已运行
+- Clash Unix socket 存在：`/tmp/verge/verge-mihomo.sock`
+- `bash`、`curl`、`jq` 可用
+- 如果要发 Telegram 通知：本机 `openclaw` CLI 可用
+- 如果要依赖 LLM timeout 联动：本机存在 OpenClaw 错误日志
+  - 默认：`~/.openclaw/logs/gateway.err.log`
 
-**添加定时任务（每 5 分钟）：**
+---
+
+## 快速开始
+
+### 1. Dry-run
+只跑检查，不实际切换：
+
 ```bash
-openclaw cron add \
-  --name "Clash 健康检查" \
-  --schedule '*/5 * * * *' \
-  --isolated \
-  --command "bash <project-root>/scripts/health_check.sh"
+cd /path/to/clash-verge-monitor
+bash scripts/health_check.sh --dry-run
 ```
 
-**验证任务已添加：**
+### 2. 实际运行
+
 ```bash
-openclaw cron list | grep "Clash"
+bash scripts/health_check.sh
 ```
 
-**手动触发测试：**
-```bash
-# 获取 job ID
-JOB_ID=$(openclaw cron list | grep "Clash 健康检查" | jq -r '.id')
+### 3. 查看统计
 
-# 手动运行
-openclaw cron run $JOB_ID --force
+```bash
+bash scripts/health_check.sh --stats
 ```
 
-**查看运行历史：**
+### 4. 重置状态
+
 ```bash
-openclaw cron runs $JOB_ID
+bash scripts/health_check.sh --reset
 ```
 
-**停用/启用任务：**
-```bash
-# 停用
-openclaw cron disable $JOB_ID
+### 5. 看日志
 
-# 启用
-openclaw cron enable $JOB_ID
-```
-
-**删除任务：**
 ```bash
-openclaw cron remove $JOB_ID
+tail -f logs/clash_health.log
 ```
 
 ---
 
-#### 方式 2：macOS LaunchAgent（备选）
+## 配置文件
 
-**创建 plist 文件：**
-```bash
-cat > ~/Library/LaunchAgents/com.clash.healthcheck.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.clash.healthcheck</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string><project-root>/scripts/health_check.sh</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>300</integer>
-    <key>StandardOutPath</key>
-    <string><project-root>/logs/clash_health.log</string>
-    <key>StandardErrorPath</key>
-    <string><project-root>/logs/clash_health.err</string>
-</dict>
-</plist>
-EOF
-```
+配置文件：
+- `config/ui_config.json`
 
-**加载任务：**
-```bash
-launchctl load ~/Library/LaunchAgents/com.clash.healthcheck.plist
-```
+当前支持的关键项：
 
-**查看状态：**
-```bash
-launchctl list | grep clash
-```
-
-**卸载任务：**
-```bash
-launchctl unload ~/Library/LaunchAgents/com.clash.healthcheck.plist
+```json
+{
+  "selector": "手动选择",
+  "intervals": {
+    "rebalanceCheckInterval": 6,
+    "minNodeDwellSeconds": 1800
+  },
+  "thresholds": {
+    "failoverImprovementMs": 50,
+    "rebalanceImprovementMs": 120,
+    "slowBasicMs": 1000,
+    "slowApiMs": 2000,
+    "slowConsecutiveLimit": 3
+  },
+  "timers": {
+    "timeoutBasicSeconds": 5,
+    "timeoutApiSeconds": 10
+  },
+  "llmTimeout": {
+    "windowSeconds": 600,
+    "threshold": 4,
+    "switchCooldownSeconds": 1800,
+    "tailLines": 5000
+  },
+  "filters": {
+    "excludeRegex": "(hong.*kong|香港|^Expire:|^到期:|剩余流量|流量重置)",
+    "includeRegex": ""
+  }
+}
 ```
 
 ---
 
-### 📊 监控与调试
+## 关键状态文件说明
 
-#### 实时日志
-```bash
-# 实时查看日志
-tail -f <project-root>/logs/clash_health.log
-```
+### `node_state.json`
+记录：
+- 最近切换时间
+- 最近切换到的节点
+- 累计切换次数
+- 健康检查累计次数
 
-#### 查看最近运行
-```bash
-# 最近 20 条
-tail -20 <project-root>/logs/clash_health.log
+### `quarantine.json`
+记录暂时隔离的失败节点。
 
-# 只看错误
-grep ERROR <project-root>/logs/clash_health.log | tail -10
+### `circuit_breaker.json`
+记录全局故障计数和熔断打开时间。
 
-# 只看切换记录
-grep "切换" <project-root>/logs/clash_health.log | tail -10
-```
+### `llm_timeout_state.json`
+记录 LLM timeout 联动切换状态：
+- 上次 timeout 触发切换时间
+- 最近已处理事件 key
+- 最近看到的事件 key
+- 最近窗口内 timeout 数量
 
-#### 测试 Telegram 通知
-```bash
-openclaw message send \
-  --channel telegram \
-  --account <your-account> \
-  --target <your-telegram-chat-id> \
-  --message "Clash 监控测试通知"
-```
-
-### 查看日志
-```bash
-# 实时日志
-tail -f <project-root>/logs/clash_health.log
-
-# 查看最近10条
-tail -n 10 <project-root>/logs/clash_health.log
-```
-
-## 配置说明
-
-### 修改配置（在脚本顶部）
-```bash
-# Clash socket 路径
-readonly SOCKET="/tmp/verge/verge-mihomo.sock"
-
-# 选择器名称
-readonly SELECTOR="手动选择"
-
-# 超时设置
-readonly TIMEOUT_BASIC=5      # Google 测试超时
-readonly TIMEOUT_API=10       # API 测试超时
-readonly SWITCH_WAIT=3        # 切换等待时间
-readonly STABILIZE_WAIT=5     # 稳定等待时间
-
-# Telegram 通知
-# 建议通过环境变量注入（未配置 TELEGRAM_TARGET 则自动跳过通知）
-TELEGRAM_ACCOUNT="${TELEGRAM_ACCOUNT:-default}"
-TELEGRAM_TARGET="${TELEGRAM_TARGET:-}"
-```
-
-## 工作原理
-
-### 健康检查流程
-```
-1. 检测 Google 基础连通性
-   ↓
-2. 检测 OpenAI API 可达性
-   ↓
-3. 检测 Anthropic API 可达性
-   ↓
-4. 如果全部通过 → 正常
-   如果任一失败 → 触发切换
-```
-
-### 节点切换逻辑
-```
-1. 获取所有可用节点
-   ↓
-2. 过滤掉 Hong Kong / 香港 节点
-   ↓
-3. 遍历节点列表
-   ↓
-4. 切换 → 等待稳定 → 健康检查
-   ↓
-5. 成功 → 发通知，结束
-   失败 → 尝试下一个节点
-   ↓
-6. 所有节点都失败 → 发警告通知
-```
-
-### HTTP 状态码判断
-- **200-499** - 认为网络可达（包括 401/404，说明能到服务器）
-- **000, 500+** - 认为网络不可达
-
-## 依赖检查
-脚本会自动检查以下依赖：
-- `curl` - HTTP 请求
-- `jq` - JSON 解析
-- `openclaw` - Telegram 通知
-
-## 并发保护
-- 使用 lockfile (`/tmp/clash_health_check.lock`)
-- 自动清理过期锁（>5分钟）
-- 避免多个实例同时切换节点
-
-## 🔧 故障排查
-
-### 问题 1: 脚本无法运行
-
-**症状：** 运行脚本时报错或无响应
-
-**排查步骤：**
-```bash
-# 1. 检查依赖
-command -v curl jq openclaw
-
-# 如果缺少，安装：
-brew install curl jq
-
-# 2. 检查 Clash socket
-ls -la /tmp/verge/verge-mihomo.sock
-
-# 3. 检查 Clash 进程
-ps aux | grep -i clash | grep -v grep
-
-# 4. 检查脚本权限
-ls -l <project-root>/scripts/health_check.sh
-
-# 如果没有执行权限：
-chmod +x <project-root>/scripts/health_check.sh
-```
-
-**常见原因：**
-- Clash Verge 未启动
-- Socket 路径不对（检查脚本中 `SOCKET` 变量）
-- 缺少依赖工具
+这个文件是避免重复消费同一波日志的关键。
 
 ---
 
-### 问题 2: 节点切换失败
+## LLM timeout 检测逻辑
 
-**症状：** 日志显示 "切换节点失败"
+脚本不会真的去发一轮大模型 prompt 做探测。
+它用的是 **OpenClaw 已经产生的真实错误日志** 作为信号源。
 
-**排查步骤：**
-```bash
-# 1. 手动测试 Clash API
-curl --unix-socket /tmp/verge/verge-mihomo.sock \
-  http://localhost/proxies/手动选择 -s | jq .
+流程大致是：
+1. 扫描 `gateway.err.log` 尾部最近 N 行
+2. 提取最近窗口内的 timeout 事件
+3. 统计数量
+4. 通过事件 key 去重
+5. 达到阈值则触发 `llm_timeout_trigger`
+6. 切换后再次复验 timeout 是否仍在持续
 
-# 2. 检查选择器名称
-curl --unix-socket /tmp/verge/verge-mihomo.sock \
-  http://localhost/proxies -s | jq 'keys'
-
-# 3. 查看错误日志
-tail -50 <project-root>/logs/clash_health.log | grep ERROR
-```
-
-**常见原因：**
-- 选择器名称错误（脚本中 `SELECTOR` 变量）
-- Clash API 未启用
-- 所有节点都被过滤掉了（检查 Hong Kong 过滤逻辑）
+这个设计的重点是：
+**用真实业务失败信号驱动切换，而不是只看轻量接口能不能通。**
 
 ---
 
-### 问题 3: Telegram 通知不发送
+## 日志里你应该看到什么
 
-**症状：** 切换成功但未收到通知
-
-**排查步骤：**
-```bash
-# 1. 测试 OpenClaw 通知
-openclaw message send \
-  --channel telegram \
-  --account <your-account> \
-  --target <your-telegram-chat-id> \
-  --message "测试通知"
-
-# 2. 检查 OpenClaw 配置
-openclaw config get channels.telegram
-
-# 3. 查看日志中的通知错误
-grep "Telegram" <project-root>/logs/clash_health.log
+### 正常健康
+```text
+[INFO] 当前节点: 🇸🇬 新加坡 09
+[INFO] LLM timeout 观察: recent_count=0, window=600s, threshold=4, latest_event_at=0
+[INFO] ✅ 服务健康
 ```
 
-**常见原因：**
-- OpenClaw Telegram 未配置
-- Account 或 Target 错误
-- 网络问题（Telegram 被墙）
+### LLM timeout 触发切换
+```text
+[INFO] LLM timeout 观察: recent_count=6, window=600s, threshold=4, latest_event_at=...
+[WARN] 检测到 OpenClaw LLM timeout 达阈值，触发节点切换
+[WARN] ⚠️ 基于 OpenClaw LLM timeout 触发节点切换
+```
+
+### 切换后复验失败
+```text
+[WARN] LLM timeout 复验未通过：recent_count=5, threshold=4
+[WARN] 切换后基础探测正常，但 LLM timeout 仍在持续，继续尝试下一个候选节点
+```
 
 ---
 
-### 问题 4: 健康检查误报
+## 给 agent 用时应该知道什么
 
-**症状：** VPN 正常但脚本认为失败
+如果你是让另一个 agent 接手这个项目，最重要的是这几条：
 
-**排查步骤：**
-```bash
-# 1. 手动测试各个 URL
-curl -s -o /dev/null -w "%{http_code}\n" https://www.google.com
-curl -s -o /dev/null -w "%{http_code}\n" https://api.openai.com/v1/models
-curl -s -o /dev/null -w "%{http_code}\n" https://api.anthropic.com
-
-# 2. 检查超时设置（脚本中 TIMEOUT_* 变量）
-grep "TIMEOUT" <project-root>/scripts/health_check.sh
-
-# 3. 调整超时时间（如果网络慢）
-# 编辑脚本，增加 TIMEOUT_API 值
-```
-
-**常见原因：**
-- 网络慢，超时设置太短
-- DNS 解析失败
-- 节点被限流
+1. **不要只盯着 README 的老描述，要以 `scripts/health_check.sh` 当前逻辑为准**
+2. 这个项目现在不是“普通的网络存活检测”，而是：
+   - 网络探测
+   - 慢速降级判断
+   - OpenClaw LLM timeout 联动
+   三套逻辑并行
+3. 真正的关键配置在：
+   - `config/ui_config.json`
+4. 真正的运行状态在：
+   - `data/state/*.json`
+5. 如果线上表现与 GitHub 不一致，先检查是不是**线上机器没 pull 最新代码**，不要先怀疑脚本闹鬼
+6. 修改这项目时，优先做 **增量修改**，不要没事重写整份脚本
 
 ---
 
-### 问题 5: 定时任务不执行
+## 推荐的 agent 交接提示词
 
-**症状：** 添加了 cron 但从不运行
+可以直接把下面这段给 agent：
 
-**排查步骤：**
-```bash
-# 1. 检查任务状态
-openclaw cron list
+```text
+请在当前仓库中工作，不要脱离现有脚本另写一套系统。
 
-# 2. 查看任务详情
-JOB_ID=$(openclaw cron list | grep "Clash" | jq -r '.id')
-openclaw cron runs $JOB_ID
+项目是一个 macOS 上的 Clash Verge / verge-mihomo 自动健康检查与节点切换脚本，核心文件是 scripts/health_check.sh。
 
-# 3. 手动触发测试
-openclaw cron run $JOB_ID --force
+当前脚本不仅做基础网络探测，还会：
+1. 检测 Google / Telegram / OpenAI / Anthropic 可达性
+2. 检测慢速降级
+3. 读取 OpenClaw ~/.openclaw/logs/gateway.err.log，识别真实 LLM timeout
+4. 在达到阈值时触发 llm_timeout_trigger 自动切换
+5. 使用 llm_timeout_state.json 做事件去重与冷却
+6. 在 llm_timeout_trigger 后做复验，避免切换后仍然超时却误判成功
 
-# 4. 检查 OpenClaw Gateway 状态
-openclaw gateway status
+工作原则：
+- 优先增量修改，不要重构整份脚本
+- 修改后必须通过 bash -n
+- 如果调整配置项，同时更新 config/ui_config.json
+- 如果修改统计口径，同时检查 --stats 输出是否仍然一致
 ```
-
-**常见原因：**
-- 任务被禁用（`enabled: false`）
-- OpenClaw Gateway 未运行
-- cron 表达式错误
 
 ---
 
-### 问题 6: 并发锁死
+## 验证建议
 
-**症状：** 脚本提示 "检测到其他实例正在运行"
-
-**排查步骤：**
+### 本地静态验证
 ```bash
-# 1. 检查锁文件
-ls -l /tmp/clash_health_check.lock
-
-# 2. 查看锁文件年龄
-stat -f %m /tmp/clash_health_check.lock
-date +%s
-
-# 3. 如果确认无其他实例，手动删除
-rm -f /tmp/clash_health_check.lock
-
-# 4. 检查是否有僵尸进程
-ps aux | grep health_check.sh | grep -v grep
+bash -n scripts/health_check.sh
+jq . config/ui_config.json >/dev/null
 ```
 
-**常见原因：**
-- 上次运行异常退出
-- 脚本超时未结束
-- 多个定时任务重复添加
+### 运行验证
+```bash
+bash scripts/health_check.sh --dry-run
+bash scripts/health_check.sh --stats
+```
+
+### 线上同步验证
+如果某台机器线上脚本表现和 GitHub 不一致，先检查：
+
+```bash
+git status
+git pull origin main
+grep -nE 'llm_timeout_still_firing|last_handled_event_key|latest_event_key|_bump_daily_fault "llm_timeout"' scripts/health_check.sh
+```
 
 ---
 
-### 🆘 仍然无法解决？
+## 注意事项
 
-**收集以下信息反馈：**
-```bash
-# 1. 系统信息
-uname -a
-sw_vers
-
-# 2. Clash 状态
-ps aux | grep clash
-
-# 3. 最近日志
-tail -50 <project-root>/logs/clash_health.log
-
-# 4. 依赖版本
-curl --version
-jq --version
-openclaw --version
-
-# 5. Clash API 测试
-curl --unix-socket /tmp/verge/verge-mihomo.sock \
-  http://localhost/proxies -s | jq 'keys | length'
-```
-
-## 未来改进
-- [ ] 支持自定义健康检查 URL
-- [ ] 节点延迟测试
-- [ ] 历史数据分析（最优节点）
-- [ ] Web 界面（可视化）
-- [ ] 支持 mihomo 和 Clash Verge 双版本
-
-## 相关项目
-- `ai-auto-clash` - mihomo (Clash.Meta) 版本
-- `email-agent` - 邮件通知
-- `devtools` - 通用工具脚本
+- 这是 **本地脚本项目**，不是 SaaS 服务
+- 正式修改应先在本地仓库完成，再 commit / push / 部署
+- 不要直接在线上机器手改后假装世界还是一致的；那会制造平行宇宙
+- 如果你真的在线上紧急止血了，记得立刻把改动回收到本地仓库
 
 ---
-*Created: 2026-03-02*  
-*Author: Nakamoto AI*  
-*Status: ✅ 生产运行*
+
+## License / Internal Use
+
+当前仓库按内部运维工具使用。若要对外公开给更多人用，建议再补：
+- 明确安装前提
+- 示例日志
+- 部署方式
+- 故障场景说明
+- License
