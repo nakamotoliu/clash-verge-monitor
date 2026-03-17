@@ -27,7 +27,6 @@ STATE_DIR="${STATE_DIR:-$PROJECT_ROOT/data/state}"
 CIRCUIT_BREAKER_FILE="$STATE_DIR/circuit_breaker.json"
 QUARANTINE_FILE="$STATE_DIR/quarantine.json"
 NODE_STATE_FILE="$STATE_DIR/node_state.json"
-LLM_TIMEOUT_STATE_FILE="$STATE_DIR/llm_timeout_state.json"
 
 TELEGRAM_ACCOUNT="${TELEGRAM_ACCOUNT:-default}"
 TELEGRAM_TARGET="${TELEGRAM_TARGET:-}"
@@ -39,7 +38,6 @@ MAIL_SENDER_SCRIPT="${MAIL_SENDER_SCRIPT:-$HOME/clawd/projects/clash-verge-monit
 
 # UI 配置文件（未来可由 Clash 客户端 UI 写入）
 CONFIG_FILE="${CONFIG_FILE:-$PROJECT_ROOT/config/ui_config.json}"
-OPENCLAW_ERR_LOG="${OPENCLAW_ERR_LOG:-$HOME/.openclaw/logs/gateway.err.log}"
 
 # 超时设置（秒）
 TIMEOUT_BASIC=3
@@ -60,12 +58,6 @@ LATENCY_FAILOVER_IMPROVEMENT_MS=50   # 故障切换场景：至少快 50ms 视�
 LATENCY_REBALANCE_IMPROVEMENT_MS=120 # 正常重平衡：至少快 120ms 才切
 MIN_NODE_DWELL_SECONDS=1800          # 最小驻留 30 分钟，避免频繁切换
 REBALANCE_CHECK_INTERVAL=6           # 每 N 次健康轮询才做一次重平衡检查
-
-# OpenClaw LLM timeout 联动切换
-LLM_TIMEOUT_WINDOW_SECONDS=600        # 最近 10 分钟
-LLM_TIMEOUT_THRESHOLD=4               # 窗口内达到阈值则触发切换
-LLM_TIMEOUT_SWITCH_COOLDOWN=1800      # 30 分钟内避免重复因同类问题频繁切换
-LLM_TIMEOUT_TAIL_LINES=5000           # 每次最多扫描错误日志尾部行数
 
 # 响应时间健康阈值（毫秒）
 # 超过此阈值视为"慢速降级"，连续多次触发切换
@@ -103,9 +95,6 @@ init() {
     [[ ! -f "$NODE_STATE_FILE" ]] && cat > "$NODE_STATE_FILE" <<EOF
 {"last_switch_at":0,"last_node":"","switch_count":0,"health_ok_count":0}
 EOF
-    [[ ! -f "$LLM_TIMEOUT_STATE_FILE" ]] && cat > "$LLM_TIMEOUT_STATE_FILE" <<EOF
-{"last_triggered_at":0,"last_handled_event_key":"","last_seen_event_at":0,"last_seen_event_key":"","last_seen_count":0}
-EOF
 
     if [[ "$STATS_MODE" == true ]]; then
         show_stats
@@ -118,10 +107,7 @@ EOF
         cat > "$NODE_STATE_FILE" <<EOF
 {"last_switch_at":0,"last_node":"","switch_count":0,"health_ok_count":0}
 EOF
-        cat > "$LLM_TIMEOUT_STATE_FILE" <<EOF
-{"last_triggered_at":0,"last_handled_event_key":"","last_seen_event_at":0,"last_seen_event_key":"","last_seen_count":0}
-EOF
-        echo "✅ 状态已重置（熔断/隔离/节点状态/LLM timeout）"
+        echo "✅ 状态已重置（熔断/隔离/节点状态）"
         exit 0
     fi
 }
@@ -143,11 +129,6 @@ load_ui_config() {
 
     v=$(jq -r '.timers.timeoutBasicSeconds // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && TIMEOUT_BASIC="$v"
     v=$(jq -r '.timers.timeoutApiSeconds // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && TIMEOUT_API="$v"
-
-    v=$(jq -r '.llmTimeout.windowSeconds // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && LLM_TIMEOUT_WINDOW_SECONDS="$v"
-    v=$(jq -r '.llmTimeout.threshold // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && LLM_TIMEOUT_THRESHOLD="$v"
-    v=$(jq -r '.llmTimeout.switchCooldownSeconds // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && LLM_TIMEOUT_SWITCH_COOLDOWN="$v"
-    v=$(jq -r '.llmTimeout.tailLines // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" && "$v" != "null" ]] && LLM_TIMEOUT_TAIL_LINES="$v"
 
     v=$(jq -r '.filters.excludeRegex // empty' "$CONFIG_FILE" 2>/dev/null || true); [[ -n "$v" ]] && FILTER_EXCLUDE_REGEX="$v"
     v=$(jq -r '.filters.includeRegex // empty' "$CONFIG_FILE" 2>/dev/null || true)
@@ -308,13 +289,6 @@ set_state_json() {
     jq "$jq_expr" "$NODE_STATE_FILE" > "$tmp" && mv "$tmp" "$NODE_STATE_FILE"
 }
 
-set_llm_timeout_state_json() {
-    local jq_expr="$1"
-    local tmp
-    tmp=$(mktemp)
-    jq "$jq_expr" "$LLM_TIMEOUT_STATE_FILE" > "$tmp" && mv "$tmp" "$LLM_TIMEOUT_STATE_FILE"
-}
-
 touch_health_ok_counter() {
     set_state_json '.health_ok_count = ((.health_ok_count // 0) + 1)'
 }
@@ -338,7 +312,7 @@ _init_daily_stats() {
     f=$(_daily_stats_file)
     [[ -f "$f" ]] && return 0
     cat > "$f" <<'STATS'
-{"date":"'$(date '+%Y-%m-%d')'","checks":0,"healthy":0,"faults":{"vpn":0,"cf":0,"api":0,"local":0,"slow":0,"llm_timeout":0},"switches":0,"circuit_breaks":0}
+{"date":"'$(date '+%Y-%m-%d')'","checks":0,"healthy":0,"faults":{"vpn":0,"cf":0,"api":0,"local":0,"slow":0},"switches":0,"circuit_breaks":0}
 STATS
     # fix the date inside the file
     local today
@@ -408,7 +382,7 @@ show_stats() {
     echo "📊 今日统计 ($today):"
     local sf="$STATE_DIR/stats_${today}.json"
     if [[ -f "$sf" ]]; then
-        local checks healthy vpn_f cf_f api_f local_f slow_f llm_timeout_f switches cbs
+        local checks healthy vpn_f cf_f api_f local_f switches cbs
         checks=$(jq -r '.checks // 0' "$sf")
         healthy=$(jq -r '.healthy // 0' "$sf")
         vpn_f=$(jq -r '.faults.vpn // 0' "$sf")
@@ -416,14 +390,13 @@ show_stats() {
         api_f=$(jq -r '.faults.api // 0' "$sf")
         local_f=$(jq -r '.faults.local // 0' "$sf")
         slow_f=$(jq -r '.faults.slow // 0' "$sf")
-        llm_timeout_f=$(jq -r '.faults.llm_timeout // 0' "$sf")
         switches=$(jq -r '.switches // 0' "$sf")
         cbs=$(jq -r '.circuit_breaks // 0' "$sf")
-        local total_faults=$((vpn_f + cf_f + api_f + local_f + slow_f + llm_timeout_f))
+        local total_faults=$((vpn_f + cf_f + api_f + local_f + slow_f))
         local pct=0
         (( checks > 0 )) && pct=$(( healthy * 100 / checks ))
         echo "   检查总数: $checks    健康: $healthy    故障: $total_faults    可用率: ${pct}%"
-        echo "   故障明细: VPN=$vpn_f  CF=$cf_f  API=$api_f  本地=$local_f  慢速=$slow_f  LLM_TIMEOUT=$llm_timeout_f"
+        echo "   故障明细: VPN=$vpn_f  CF=$cf_f  API=$api_f  本地=$local_f  慢速=$slow_f"
         echo "   节点切换: $switches    熔断: $cbs"
     else
         echo "   (暂无数据)"
@@ -434,7 +407,7 @@ show_stats() {
     echo "📊 昨日统计 ($yesterday):"
     local yf="$STATE_DIR/stats_${yesterday}.json"
     if [[ -f "$yf" ]]; then
-        local checks healthy vpn_f cf_f api_f local_f slow_f llm_timeout_f switches
+        local checks healthy vpn_f cf_f api_f local_f switches
         checks=$(jq -r '.checks // 0' "$yf")
         healthy=$(jq -r '.healthy // 0' "$yf")
         vpn_f=$(jq -r '.faults.vpn // 0' "$yf")
@@ -442,13 +415,12 @@ show_stats() {
         api_f=$(jq -r '.faults.api // 0' "$yf")
         local_f=$(jq -r '.faults.local // 0' "$yf")
         slow_f=$(jq -r '.faults.slow // 0' "$yf")
-        llm_timeout_f=$(jq -r '.faults.llm_timeout // 0' "$yf")
         switches=$(jq -r '.switches // 0' "$yf")
-        local total_faults=$((vpn_f + cf_f + api_f + local_f + slow_f + llm_timeout_f))
+        local total_faults=$((vpn_f + cf_f + api_f + local_f + slow_f))
         local pct=0
         (( checks > 0 )) && pct=$(( healthy * 100 / checks ))
         echo "   检查总数: $checks    健康: $healthy    故障: $total_faults    可用率: ${pct}%"
-        echo "   故障明细: VPN=$vpn_f  CF=$cf_f  API=$api_f  本地=$local_f  慢速=$slow_f  LLM_TIMEOUT=$llm_timeout_f"
+        echo "   故障明细: VPN=$vpn_f  CF=$cf_f  API=$api_f  本地=$local_f  慢速=$slow_f"
         echo "   节点切换: $switches"
     else
         echo "   (无数据)"
@@ -649,102 +621,6 @@ get_node_delay_ms() {
     fi
 }
 
-# ==================== OpenClaw LLM timeout 感知 ====================
-inspect_recent_llm_timeouts() {
-    if [[ ! -f "$OPENCLAW_ERR_LOG" ]]; then
-        echo '{"count":0,"latest_event_at":0}'
-        return 0
-    fi
-
-    python3 - "$OPENCLAW_ERR_LOG" "$LLM_TIMEOUT_WINDOW_SECONDS" "$LLM_TIMEOUT_TAIL_LINES" <<'PY'
-import collections
-import json
-import re
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-log_path = Path(sys.argv[1])
-window_seconds = int(sys.argv[2])
-tail_lines = int(sys.argv[3])
-patterns = [
-    re.compile(r'LLM request timed out\.'),
-    re.compile(r'FailoverError: LLM request timed out\.'),
-    re.compile(r'All models failed .* timeout'),
-]
-lines = collections.deque(maxlen=tail_lines)
-with log_path.open('r', encoding='utf-8', errors='ignore') as fh:
-    for line in fh:
-        lines.append(line.rstrip('\n'))
-
-now = datetime.now(timezone.utc).timestamp()
-latest_event_at = 0
-count = 0
-for line in lines:
-    if not any(p.search(line) for p in patterns):
-        continue
-    m = re.match(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))', line)
-    if not m:
-        continue
-    try:
-        ts = datetime.fromisoformat(m.group(1).replace('Z', '+00:00')).timestamp()
-    except Exception:
-        continue
-    if now - ts <= window_seconds:
-        count += 1
-        if ts > latest_event_at:
-            latest_event_at = int(ts)
-event_key = ""
-if latest_event_at:
-    matching = [line for line in lines if any(p.search(line) for p in patterns)]
-    if matching:
-        event_key = matching[-1][-160:]
-print(json.dumps({"count": count, "latest_event_at": latest_event_at, "latest_event_key": event_key}))
-PY
-}
-
-maybe_trigger_llm_timeout_switch() {
-    local current_node="$1"
-    local observed_json recent_count latest_event_at latest_event_key now last_triggered_at last_handled_event_key cooldown_remaining tmp
-
-    observed_json=$(inspect_recent_llm_timeouts)
-    recent_count=$(echo "$observed_json" | jq -r '.count // 0')
-    latest_event_at=$(echo "$observed_json" | jq -r '.latest_event_at // 0')
-    latest_event_key=$(echo "$observed_json" | jq -r '.latest_event_key // ""')
-
-    tmp=$(mktemp)
-    jq --arg event_key "$latest_event_key" --argjson event_at "$latest_event_at" --argjson seen_count "$recent_count" \
-       '.last_seen_count=$seen_count | .last_seen_event_at=$event_at | .last_seen_event_key=$event_key' \
-       "$LLM_TIMEOUT_STATE_FILE" > "$tmp" && mv "$tmp" "$LLM_TIMEOUT_STATE_FILE"
-    log "INFO" "LLM timeout 观察: recent_count=${recent_count}, window=${LLM_TIMEOUT_WINDOW_SECONDS}s, threshold=${LLM_TIMEOUT_THRESHOLD}, latest_event_at=${latest_event_at}"
-
-    if (( recent_count < LLM_TIMEOUT_THRESHOLD )); then
-        return 1
-    fi
-
-    last_triggered_at=$(jq -r '.last_triggered_at // 0' "$LLM_TIMEOUT_STATE_FILE")
-    last_handled_event_key=$(jq -r '.last_handled_event_key // ""' "$LLM_TIMEOUT_STATE_FILE")
-    now=$(date +%s)
-
-    if [[ -n "$latest_event_key" && "$latest_event_key" == "$last_handled_event_key" ]]; then
-        log "INFO" "LLM timeout 已处理过同一批事件，跳过切换（event_key matched）"
-        return 1
-    fi
-
-    if (( now - last_triggered_at < LLM_TIMEOUT_SWITCH_COOLDOWN )); then
-        cooldown_remaining=$((LLM_TIMEOUT_SWITCH_COOLDOWN - (now - last_triggered_at)))
-        log "WARN" "LLM timeout 达阈值，但处于冷却中，跳过切换（剩余 ${cooldown_remaining}s）"
-        return 1
-    fi
-
-    log "WARN" "检测到 OpenClaw LLM timeout 达阈值，触发节点切换：current=${current_node}, recent_count=${recent_count}, window=${LLM_TIMEOUT_WINDOW_SECONDS}s"
-    tmp=$(mktemp)
-    jq --arg event_key "$latest_event_key" --argjson now "$now" --argjson seen_count "$recent_count" --argjson event_at "$latest_event_at" \
-       '.last_triggered_at=$now | .last_handled_event_key=$event_key | .last_seen_count=$seen_count | .last_seen_event_at=$event_at | .last_seen_event_key=$event_key' \
-       "$LLM_TIMEOUT_STATE_FILE" > "$tmp" && mv "$tmp" "$LLM_TIMEOUT_STATE_FILE"
-    return 0
-}
-
 # ==================== 故障分类 ====================
 
 # check_url_timed: 检测 URL 可达性 + 响应时间
@@ -902,7 +778,7 @@ classify_fault() {
 # 输出："node<TAB>delay<TAB>score"
 rank_candidates() {
     local current_node="$1"
-    local -a nodes=()
+    local -a nodes
     local node delay score penalty
 
     while IFS= read -r node; do
@@ -989,28 +865,15 @@ maybe_rebalance_when_healthy() {
 }
 
 # ==================== 故障切换（按延迟+稳定性） ====================
-llm_timeout_still_firing() {
-    local observed_json recent_count
-    observed_json=$(inspect_recent_llm_timeouts)
-    recent_count=$(echo "$observed_json" | jq -r '.count // 0')
-    if (( recent_count >= LLM_TIMEOUT_THRESHOLD )); then
-        log "WARN" "LLM timeout 复验未通过：recent_count=${recent_count}, threshold=${LLM_TIMEOUT_THRESHOLD}"
-        return 0
-    fi
-    log "INFO" "LLM timeout 复验通过：recent_count=${recent_count}, threshold=${LLM_TIMEOUT_THRESHOLD}"
-    return 1
-}
-
 smart_switch() {
     local current_node="$1"
-    local trigger_reason="${2:-health_check_trigger}"
     local current_delay best_line best_node best_delay best_score attempt=0
 
     current_delay=$(get_node_delay_ms "$current_node")
     [[ "$current_delay" -lt 0 ]] && current_delay=99999
 
-    log "WARN" "⚠️ 当前节点 [$current_node] 触发智能切换，reason=${trigger_reason}"
-    send_alert "节点故障" "⚠️ VPN 节点故障\n当前: $current_node\n触发原因: ${trigger_reason}\n开始智能切换（含延迟评分）"
+    log "WARN" "⚠️ 当前节点 [$current_node] 故障，开始智能切换..."
+    send_alert "节点故障" "⚠️ VPN 节点故障\n当前: $current_node\n开始智能切换（含延迟评分）"
 
     cleanup_quarantine
     quarantine_node "$current_node"
@@ -1049,14 +912,9 @@ smart_switch() {
         fi
 
         if [[ $fault_type -eq 0 ]]; then
-            if [[ "$trigger_reason" == "llm_timeout_trigger" ]] && llm_timeout_still_firing; then
-                log "WARN" "切换后基础探测正常，但 LLM timeout 仍在持续，继续尝试下一个候选节点"
-                quarantine_node "$best_node"
-                continue
-            fi
             log "INFO" "✅ 切换成功: $best_node"
             reset_failure_count
-            send_alert "恢复通知" "✅ VPN 恢复\n新节点: $best_node\n延迟: ${best_delay}ms\n尝试次数: $attempt\n触发原因: ${trigger_reason}"
+            send_alert "恢复通知" "✅ VPN 恢复\n新节点: $best_node\n延迟: ${best_delay}ms\n尝试次数: $attempt"
             return 0
         fi
 
@@ -1125,19 +983,6 @@ main() {
     }
     log "INFO" "当前节点: $current_node"
 
-    if maybe_trigger_llm_timeout_switch "$current_node"; then
-        log "WARN" "⚠️ 基于 OpenClaw LLM timeout 触发节点切换"
-        _bump_daily_fault "llm_timeout"
-        if smart_switch "$current_node" "llm_timeout_trigger"; then
-            _bump_daily_stat "switches"
-            log "INFO" "========== 完成：LLM timeout 触发已切换 =========="
-            exit 0
-        else
-            log "ERROR" "========== 完成：LLM timeout 触发切换失败 =========="
-            exit 1
-        fi
-    fi
-
     local fault_type=0
     if classify_fault; then
         fault_type=0
@@ -1157,7 +1002,7 @@ main() {
         1)
             log "WARN" "⚠️ 节点级故障，开始故障切换"
             _bump_daily_fault "vpn"
-            if smart_switch "$current_node" "health_check_trigger"; then
+            if smart_switch "$current_node"; then
                 _bump_daily_stat "switches"
                 log "INFO" "========== 完成：已切换 =========="
                 exit 0
@@ -1187,7 +1032,7 @@ main() {
         5)
             log "WARN" "🐌 慢速降级，尝试切换更快节点"
             _bump_daily_fault "slow"
-            if smart_switch "$current_node" "slow_degrade_trigger"; then
+            if smart_switch "$current_node"; then
                 _bump_daily_stat "switches"
                 log "INFO" "========== 完成：慢速切换成功 =========="
                 exit 0
