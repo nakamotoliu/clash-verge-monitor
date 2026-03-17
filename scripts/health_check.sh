@@ -706,12 +706,10 @@ _set_slow_count() {
     echo "$1" > "$(_slow_count_file)"
 }
 
-# 0 正常
-# 1 VPN/节点故障（可切换）
-# 2 Cloudflare 全局故障（不切）
-# 3 上游 API 故障（不切）
-# 4 本地网络故障（不切）
-# 5 慢速降级（可切换）— 新增
+# 0 正常（模型可达且延迟可接受）
+# 1 模型不可达/超时（立即切换）
+# 5 模型慢速降级（可切换）
+# 2/3/4 旧分类保留注释位，当前模型优先策略下不再返回
 classify_fault() {
     local basic_ok=false cloudflare_ok=false google_ok=false telegram_ok=false openai_ok=false anthropic_ok=false
     local basic_ms=0 cloudflare_ms=0 google_ms=0 telegram_ms=0 openai_ms=0 anthropic_ms=0
@@ -749,64 +747,48 @@ classify_fault() {
     [[ "$openai_ok" == true ]] && log "DEBUG" "✅ OpenAI 正常 (${openai_ms}ms)" || log "DEBUG" "❌ OpenAI 异常"
     [[ "$anthropic_ok" == true ]] && log "DEBUG" "✅ Anthropic 正常 (${anthropic_ms}ms)" || log "DEBUG" "❌ Anthropic 异常"
 
-    # 先判断不可达
-    if [[ "$google_ok" == true && "$telegram_ok" == true && "$openai_ok" == true && "$anthropic_ok" == true ]]; then
-        # 全部可达，再检查是否慢速
-        local is_slow=false
-        local slow_targets=""
+    # 以模型可用性为核心健康标准：
+    # - 任何一个模型不可达/超时：立即切换（节点级故障）
+    # - 模型都可达但延迟持续偏高：按慢速降级策略切换
+    # - 基础网络探针仅作诊断日志，不主导切换决策
 
-        if [[ "$google_ok" == true ]] && (( google_ms > SLOW_THRESHOLD_BASIC_MS )); then
-            is_slow=true; slow_targets+="Google(${google_ms}ms) "
-        fi
-        if [[ "$openai_ok" == true ]] && (( openai_ms > SLOW_THRESHOLD_API_MS )); then
-            is_slow=true; slow_targets+="OpenAI(${openai_ms}ms) "
-        fi
-        if [[ "$anthropic_ok" == true ]] && (( anthropic_ms > SLOW_THRESHOLD_API_MS )); then
-            is_slow=true; slow_targets+="Anthropic(${anthropic_ms}ms) "
-        fi
-
-        if [[ "$is_slow" == true ]]; then
-            local count
-            count=$(_get_slow_count)
-            count=$((count + 1))
-            _set_slow_count "$count"
-            log "WARN" "🐌 慢速检测: ${slow_targets}(连续 ${count}/${SLOW_CONSECUTIVE_LIMIT})"
-
-            if (( count >= SLOW_CONSECUTIVE_LIMIT )); then
-                log "WARN" "🐌 连续 ${count} 次慢速，触发降级切换"
-                _set_slow_count 0
-                return 5
-            fi
-        else
-            # 速度正常，重置计数器
-            _set_slow_count 0
-        fi
-
-        return 0
-    fi
-
-    if [[ "$basic_ok" == false ]]; then
-        _set_slow_count 0
-        return 4
-    fi
-
-    if [[ "$google_ok" == false || "$telegram_ok" == false ]]; then
+    if [[ "$openai_ok" == false || "$anthropic_ok" == false ]]; then
+        local unavailable_targets=""
+        [[ "$openai_ok" == false ]] && unavailable_targets+="OpenAI "
+        [[ "$anthropic_ok" == false ]] && unavailable_targets+="Anthropic "
+        log "WARN" "🤖 模型不可达或超时：${unavailable_targets}，立即触发切换"
         _set_slow_count 0
         return 1
     fi
 
-    if [[ "$cloudflare_ok" == false && "$openai_ok" == false ]]; then
-        _set_slow_count 0
-        return 2
+    # 模型均可达，再判断模型延迟是否慢速
+    local is_slow=false
+    local slow_targets=""
+
+    if (( openai_ms > SLOW_THRESHOLD_API_MS )); then
+        is_slow=true; slow_targets+="OpenAI(${openai_ms}ms) "
+    fi
+    if (( anthropic_ms > SLOW_THRESHOLD_API_MS )); then
+        is_slow=true; slow_targets+="Anthropic(${anthropic_ms}ms) "
     fi
 
-    if [[ "$google_ok" == true && "$telegram_ok" == true && "$openai_ok" == false && "$anthropic_ok" == false ]]; then
+    if [[ "$is_slow" == true ]]; then
+        local count
+        count=$(_get_slow_count)
+        count=$((count + 1))
+        _set_slow_count "$count"
+        log "WARN" "🐌 模型慢速检测: ${slow_targets}(连续 ${count}/${SLOW_CONSECUTIVE_LIMIT})"
+
+        if (( count >= SLOW_CONSECUTIVE_LIMIT )); then
+            log "WARN" "🐌 连续 ${count} 次模型慢速，触发降级切换"
+            _set_slow_count 0
+            return 5
+        fi
+    else
         _set_slow_count 0
-        return 3
     fi
 
-    _set_slow_count 0
-    return 1
+    return 0
 }
 
 # ==================== 延迟评分与选择 ====================
