@@ -568,11 +568,24 @@ get_current_node() {
 }
 
 get_available_nodes() {
-    local nodes selector_encoded
+    local response selector_encoded raw_nodes nodes raw_count filtered_count
     selector_encoded=$(uri_encode "$SELECTOR")
-    nodes=$(clash_api "GET" "/proxies/$selector_encoded" \
-      | jq -r '.all[]' 2>/dev/null \
-      | grep -vE "^(DIRECT|REJECT)$")
+    response=$(clash_api "GET" "/proxies/$selector_encoded" || true)
+
+    if [[ -z "$response" ]]; then
+        log "WARN" "Clash API 未返回 selector 数据（selector=$SELECTOR）"
+        return 0
+    fi
+
+    raw_nodes=$(echo "$response" | jq -r '.all[]?' 2>/dev/null | grep -vE "^(DIRECT|REJECT)$" || true)
+    raw_count=$(echo "$raw_nodes" | sed '/^$/d' | wc -l | tr -d ' ')
+
+    if [[ "$raw_count" == "0" ]]; then
+        log "WARN" "selector 未返回可用节点（selector=$SELECTOR）"
+        return 0
+    fi
+
+    nodes="$raw_nodes"
 
     if [[ -n "$FILTER_EXCLUDE_REGEX" ]]; then
         nodes=$(echo "$nodes" | grep -viE "$FILTER_EXCLUDE_REGEX" || true)
@@ -580,6 +593,12 @@ get_available_nodes() {
 
     if [[ -n "$FILTER_INCLUDE_REGEX" ]]; then
         nodes=$(echo "$nodes" | grep -iE "$FILTER_INCLUDE_REGEX" || true)
+    fi
+
+    filtered_count=$(echo "$nodes" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [[ "$filtered_count" == "0" ]]; then
+        log "WARN" "节点在过滤后为空（selector=$SELECTOR，raw=$raw_count，exclude=$FILTER_EXCLUDE_REGEX，include=${FILTER_INCLUDE_REGEX:-<empty>}）"
+        return 0
     fi
 
     echo "$nodes"
