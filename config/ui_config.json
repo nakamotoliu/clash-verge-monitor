@@ -13,7 +13,7 @@
     "timeoutApiSeconds": 10
   },
   "filters": {
-    "excludeRegex": "(hong.*kong|香港|^Expire:|^到期:|剩余流量|流量重置)",
+    "excludeRegex": "(hong.*kong|香港|^Traffic:|^Expire:|^到期:|剩余流量|流量重置)",
     "includeRegex": ""
   }
 }

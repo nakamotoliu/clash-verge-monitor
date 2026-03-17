@@ -21,8 +21,8 @@
 ### v2.2（进行中）新增：UI 配置化双引擎
 - 双引擎并行：故障切换 + 定时重平衡
 - 参数由 `config/ui_config.json` 读取（后续可由 UI 面板写入）
-- 节点过滤支持 `excludeRegex/includeRegex`
-- 默认过滤订阅信息行：`Expire/到期/剩余流量/流量重置`
+- 节点过滤支持 `excludeRegex/includeRegex`（运行时以 `config/ui_config.json` 为准，脚本内置默认值仅作 fallback）
+- 默认过滤订阅信息行：`Traffic/Expire/到期/剩余流量/流量重置`
 
 ### v2.1 快速开始
 ```bash
