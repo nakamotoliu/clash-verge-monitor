@@ -72,7 +72,7 @@ CANARY_GOOGLE="https://www.google.com"
 CANARY_TELEGRAM="https://api.telegram.org"
 
 # 节点过滤（关键词/正则）
-FILTER_EXCLUDE_REGEX="(hong.*kong|香港|^Expire:|^到期:|剩余流量|流量重置)"
+FILTER_EXCLUDE_REGEX="(hong.*kong|香港|^Traffic:|^Expire:|^到期:|剩余流量|流量重置)"
 FILTER_INCLUDE_REGEX=""
 
 readonly HTTP_CODE_MIN=200
