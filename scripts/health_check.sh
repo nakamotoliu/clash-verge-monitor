@@ -778,12 +778,17 @@ classify_fault() {
 # 输出："node<TAB>delay<TAB>score"
 rank_candidates() {
     local current_node="$1"
-    local -a nodes
+    local -a nodes=()
     local node delay score penalty
 
     while IFS= read -r node; do
         [[ -n "$node" ]] && nodes+=("$node")
-    done < <(get_available_nodes)
+    done < <(get_available_nodes || true)
+
+    if (( ${#nodes[@]} == 0 )); then
+        log "WARN" "候选节点列表为空（selector=$SELECTOR，current=$current_node）"
+        return 0
+    fi
 
     for node in "${nodes[@]}"; do
         [[ -z "$node" ]] && continue
