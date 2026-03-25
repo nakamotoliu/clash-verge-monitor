@@ -747,16 +747,17 @@ classify_fault() {
     [[ "$openai_ok" == true ]] && log "DEBUG" "✅ OpenAI 正常 (${openai_ms}ms)" || log "DEBUG" "❌ OpenAI 异常"
     [[ "$anthropic_ok" == true ]] && log "DEBUG" "✅ Anthropic 正常 (${anthropic_ms}ms)" || log "DEBUG" "❌ Anthropic 异常"
 
-    # 以模型可用性为核心健康标准：
-    # - 任何一个模型不可达/超时：立即切换（节点级故障）
-    # - 模型都可达但延迟持续偏高：按慢速降级策略切换
+    # 以关键上游可用性为核心健康标准：
+    # - OpenAI / Anthropic / Telegram 任一不可达或超时：立即切换（节点级故障）
+    # - OpenAI / Anthropic 都可达但延迟持续偏高：按慢速降级策略切换
     # - 基础网络探针仅作诊断日志，不主导切换决策
 
-    if [[ "$openai_ok" == false || "$anthropic_ok" == false ]]; then
+    if [[ "$openai_ok" == false || "$anthropic_ok" == false || "$telegram_ok" == false ]]; then
         local unavailable_targets=""
         [[ "$openai_ok" == false ]] && unavailable_targets+="OpenAI "
         [[ "$anthropic_ok" == false ]] && unavailable_targets+="Anthropic "
-        log "WARN" "🤖 模型不可达或超时：${unavailable_targets}，立即触发切换"
+        [[ "$telegram_ok" == false ]] && unavailable_targets+="Telegram "
+        log "WARN" "🤖 关键上游不可达或超时：${unavailable_targets}，立即触发切换"
         _set_slow_count 0
         return 1
     fi
