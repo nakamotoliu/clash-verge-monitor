@@ -72,7 +72,7 @@ CANARY_GOOGLE="https://www.google.com"
 CANARY_TELEGRAM="https://api.telegram.org"
 
 # 节点过滤（关键词/正则）
-FILTER_EXCLUDE_REGEX="(hong.*kong|香港|^Traffic:|^Expire:|^到期:|剩余流量|流量重置)"
+FILTER_EXCLUDE_REGEX="(hong.*kong|香港|^Traffic:|^Expire:|^到期:|^Sync:|剩余流量|流量重置|^自动选择$)"
 FILTER_INCLUDE_REGEX=""
 
 readonly HTTP_CODE_MIN=200
@@ -562,9 +562,40 @@ clash_api() {
 }
 
 get_current_node() {
-    local selector_encoded
+    local selector_encoded current
     selector_encoded=$(uri_encode "$SELECTOR")
-    clash_api "GET" "/proxies/$selector_encoded" | jq -r '.now' 2>/dev/null
+    current=$(clash_api "GET" "/proxies/$selector_encoded" | jq -r '.now // empty' 2>/dev/null || true)
+    current=$(sanitize_node_name "$current" || true)
+    if [[ -n "$current" ]]; then
+        printf '%s\n' "$current"
+        return 0
+    fi
+
+    # fallback: 如果手动选择当前指向的是“自动选择”这种 selector，则继续展开一层拿真实出口节点
+    local auto_encoded auto_now
+    auto_encoded=$(uri_encode "自动选择")
+    auto_now=$(clash_api "GET" "/proxies/$auto_encoded" | jq -r '.now // empty' 2>/dev/null || true)
+    sanitize_node_name "$auto_now" || true
+}
+
+sanitize_node_name() {
+    local node="$1"
+    [[ -z "$node" ]] && return 1
+    [[ "$node" =~ ^(DIRECT|REJECT)$ ]] && return 1
+    local metadata_exclude_regex="(^Traffic:|^Expire:|^到期:|^Sync:|剩余流量|流量重置|^自动选择$)"
+    if [[ -n "$metadata_exclude_regex" ]] && echo "$node" | grep -qiE "$metadata_exclude_regex"; then
+        return 1
+    fi
+    if [[ -n "$FILTER_INCLUDE_REGEX" ]] && ! echo "$node" | grep -qiE "$FILTER_INCLUDE_REGEX"; then
+        return 1
+    fi
+    printf '%s\n' "$node"
+}
+
+is_hk_node() {
+    local node="$1"
+    [[ -z "$node" ]] && return 1
+    echo "$node" | grep -qiE '(hong.*kong|香港)'
 }
 
 get_available_nodes() {
@@ -620,6 +651,18 @@ get_available_nodes() {
     done
 }
 
+is_candidate_allowed() {
+    local node="$1"
+    sanitize_node_name "$node" >/dev/null || return 1
+    if [[ -n "$FILTER_EXCLUDE_REGEX" ]] && echo "$node" | grep -qiE "$FILTER_EXCLUDE_REGEX"; then
+        return 1
+    fi
+    if [[ -n "$FILTER_INCLUDE_REGEX" ]] && ! echo "$node" | grep -qiE "$FILTER_INCLUDE_REGEX"; then
+        return 1
+    fi
+    return 0
+}
+
 switch_node() {
     local node="$1" selector_encoded
     selector_encoded=$(uri_encode "$SELECTOR")
@@ -640,19 +683,59 @@ switch_node() {
     return 0
 }
 
-get_node_delay_ms() {
+check_url_via_proxy_timed() {
+    local url="$1" timeout="$2"
+    local proxy_port="7897"
+    local result http_code time_s time_ms
+    result=$(curl -x "http://127.0.0.1:${proxy_port}" -s -o /dev/null -w "%{http_code} %{time_total}" --max-time "$timeout" "$url" 2>/dev/null || echo "000 0")
+    http_code=$(echo "$result" | awk '{print $1}')
+    time_s=$(echo "$result" | awk '{print $2}')
+    time_ms=$(echo "$time_s" | awk '{printf "%d", $1 * 1000}')
+    echo "$http_code $time_ms"
+    if [[ "$http_code" -ge "$HTTP_CODE_MIN" && "$http_code" -le "$HTTP_CODE_MAX" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+score_candidate_node() {
     local node="$1"
-    local encoded url_encoded resp delay
-    encoded=$(uri_encode "$node")
-    url_encoded=$(uri_encode "$DELAY_TEST_URL")
+    local selector_encoded old_node switched=false
+    local telegram_ms openai_ms anthropic_ms
+    local code result score=0
 
-    resp=$(clash_api "GET" "/proxies/${encoded}/delay?timeout=${DELAY_TIMEOUT_MS}&url=${url_encoded}") || true
-    delay=$(echo "$resp" | jq -r '.delay // -1' 2>/dev/null || echo -1)
+    is_candidate_allowed "$node" || return 1
 
-    if [[ "$delay" =~ ^[0-9]+$ ]] && [[ "$delay" -ge 0 ]]; then
-        echo "$delay"
-    else
-        echo -1
+    selector_encoded=$(uri_encode "$SELECTOR")
+    old_node=$(get_current_node || true)
+    [[ -z "$old_node" ]] && return 1
+
+    if [[ "$old_node" != "$node" ]]; then
+        if ! clash_api "PUT" "/proxies/$selector_encoded" "{\"name\":\"$node\"}" >/dev/null; then
+            return 1
+        fi
+        switched=true
+        sleep "$SWITCH_WAIT"
+    fi
+
+    result=$(check_url_via_proxy_timed "$CANARY_TELEGRAM" "$TIMEOUT_API" || true)
+    code=$(echo "$result" | awk '{print $1}'); telegram_ms=$(echo "$result" | awk '{print $2}')
+    [[ "$code" -ge "$HTTP_CODE_MIN" && "$code" -le "$HTTP_CODE_MAX" ]] || telegram_ms=99999
+
+    result=$(check_url_via_proxy_timed "https://api.openai.com/v1/models" "$TIMEOUT_API" || true)
+    code=$(echo "$result" | awk '{print $1}'); openai_ms=$(echo "$result" | awk '{print $2}')
+    [[ "$code" -ge "$HTTP_CODE_MIN" && "$code" -le "$HTTP_CODE_MAX" ]] || openai_ms=99999
+
+    result=$(check_url_via_proxy_timed "https://api.anthropic.com" "$TIMEOUT_API" || true)
+    code=$(echo "$result" | awk '{print $1}'); anthropic_ms=$(echo "$result" | awk '{print $2}')
+    [[ "$code" -ge "$HTTP_CODE_MIN" && "$code" -le "$HTTP_CODE_MAX" ]] || anthropic_ms=99999
+
+    score=$((telegram_ms + openai_ms + anthropic_ms))
+    echo -e "${node}\t${telegram_ms}\t${openai_ms}\t${anthropic_ms}\t${score}"
+
+    if [[ "$switched" == true && -n "$old_node" && "$old_node" != "$node" ]]; then
+        clash_api "PUT" "/proxies/$selector_encoded" "{\"name\":\"$old_node\"}" >/dev/null || true
+        sleep 1
     fi
 }
 
@@ -792,12 +875,12 @@ classify_fault() {
     return 0
 }
 
-# ==================== 延迟评分与选择 ====================
-# 输出："node<TAB>delay<TAB>score"
+# ==================== 候选评分与选择 ====================
+# 输出："node<TAB>telegram_ms<TAB>openai_ms<TAB>anthropic_ms<TAB>score"
 rank_candidates() {
     local current_node="$1"
     local -a nodes=()
-    local node delay score penalty
+    local node
 
     while IFS= read -r node; do
         [[ -n "$node" ]] && nodes+=("$node")
@@ -817,18 +900,8 @@ rank_candidates() {
             continue
         fi
 
-        delay=$(get_node_delay_ms "$node")
-        if [[ "$delay" -lt 0 ]]; then
-            # 无法测延迟，给高惩罚
-            score=99999
-        else
-            penalty=0
-            # 可扩展：按地区/历史失败给 penalty，这里先保留接口
-            score=$((delay + penalty))
-        fi
-
-        echo -e "${node}\t${delay}\t${score}"
-    done | sort -t$'\t' -k3,3n
+        score_candidate_node "$node" || true
+    done | sort -t$'\t' -k5,5n
 }
 
 # 正常态重平衡（防抖）：
@@ -837,7 +910,7 @@ rank_candidates() {
 # - 改善幅度不够不切
 maybe_rebalance_when_healthy() {
     local current_node="$1"
-    local ok_count last_switch_at now dwell best_line best_node best_delay current_delay improvement
+    local ok_count last_switch_at now dwell best_line best_node best_score current_line current_score improvement
 
     ok_count=$(get_state_value "health_ok_count")
     [[ -z "$ok_count" || "$ok_count" == "null" ]] && ok_count=0
@@ -848,27 +921,22 @@ maybe_rebalance_when_healthy() {
         return 0
     fi
 
-    current_delay=$(get_node_delay_ms "$current_node")
-    if [[ "$current_delay" -lt 0 ]]; then
-        log "DEBUG" "当前节点延迟不可测，跳过重平衡"
-        return 0
-    fi
+    current_line=$(score_candidate_node "$current_node" || true)
+    [[ -z "$current_line" ]] && return 0
+    current_score=$(echo "$current_line" | awk -F'\t' '{print $5}')
 
     best_line=$(rank_candidates "$current_node" | head -1 || true)
     [[ -z "$best_line" ]] && return 0
 
     best_node=$(echo "$best_line" | awk -F'\t' '{print $1}')
-    best_delay=$(echo "$best_line" | awk -F'\t' '{print $2}')
-
-    [[ "$best_delay" -lt 0 ]] && return 0
-
-    improvement=$((current_delay - best_delay))
+    best_score=$(echo "$best_line" | awk -F'\t' '{print $5}')
+    improvement=$((current_score - best_score))
     last_switch_at=$(get_state_value "last_switch_at")
     [[ -z "$last_switch_at" || "$last_switch_at" == "null" ]] && last_switch_at=0
     now=$(date +%s)
     dwell=$((now - last_switch_at))
 
-    log "INFO" "重平衡评估: current=${current_node}(${current_delay}ms), best=${best_node}(${best_delay}ms), improvement=${improvement}ms, dwell=${dwell}s"
+    log "INFO" "重平衡评估: current=${current_node}(score=${current_score}), best=${best_node}(score=${best_score}), improvement=${improvement}, dwell=${dwell}s"
 
     if (( dwell < MIN_NODE_DWELL_SECONDS )); then
         log "INFO" "防抖: 驻留未满 ${MIN_NODE_DWELL_SECONDS}s，不切换"
@@ -876,48 +944,46 @@ maybe_rebalance_when_healthy() {
     fi
 
     if (( improvement < LATENCY_REBALANCE_IMPROVEMENT_MS )); then
-        log "INFO" "防抖: 改善不足 ${LATENCY_REBALANCE_IMPROVEMENT_MS}ms，不切换"
+        log "INFO" "防抖: 改善不足 ${LATENCY_REBALANCE_IMPROVEMENT_MS}，不切换"
         return 0
     fi
 
-    # 满足条件才切（较少发生）
-    log "WARN" "⚖️ 触发重平衡切换: $current_node(${current_delay}ms) -> $best_node(${best_delay}ms)"
+    log "WARN" "⚖️ 触发重平衡切换: $current_node(score=${current_score}) -> $best_node(score=${best_score})"
     if switch_node "$best_node"; then
-        send_alert "节点重平衡" "⚖️ 节点重平衡\n$current_node(${current_delay}ms) → $best_node(${best_delay}ms)\n改善 ${improvement}ms"
+        send_alert "节点重平衡" "⚖️ 节点重平衡\n$current_node(score=${current_score}) → $best_node(score=${best_score})\n改善 ${improvement}"
     fi
 }
 
-# ==================== 故障切换（按延迟+稳定性） ====================
+# ==================== 故障切换（按 Telegram/OpenAI/Anthropic 加权评分） ====================
 smart_switch() {
     local current_node="$1"
-    local current_delay best_line best_node best_delay best_score attempt=0
+    local current_line current_score best_node telegram_ms openai_ms anthropic_ms best_score attempt=0
 
-    current_delay=$(get_node_delay_ms "$current_node")
-    [[ "$current_delay" -lt 0 ]] && current_delay=99999
+    current_line=$(score_candidate_node "$current_node" || true)
+    current_score=$(echo "$current_line" | awk -F'\t' '{print $5}')
+    [[ -z "$current_score" ]] && current_score=99999
 
     log "WARN" "⚠️ 当前节点 [$current_node] 故障，开始智能切换..."
-    send_alert "节点故障" "⚠️ VPN 节点故障\n当前: $current_node\n开始智能切换（含延迟评分）"
+    send_alert "节点故障" "⚠️ VPN 节点故障\n当前: $current_node\n开始智能切换（Telegram/OpenAI/Anthropic 评分）"
 
     cleanup_quarantine
     quarantine_node "$current_node"
 
-    # 按 score 从低到高挑节点，最多尝试 N 次
-    while IFS=$'\t' read -r best_node best_delay best_score; do
+    while IFS=$'\t' read -r best_node telegram_ms openai_ms anthropic_ms best_score; do
         [[ -z "${best_node:-}" ]] && continue
         ((attempt++))
         if (( attempt > MAX_SWITCH_ATTEMPTS )); then
             break
         fi
 
-        # 如果延迟改善非常有限，且不是首次尝试，可跳过，避免无意义切换
-        if [[ "$best_delay" =~ ^[0-9]+$ ]] && (( best_delay >= 0 )); then
-            if (( current_delay - best_delay < LATENCY_FAILOVER_IMPROVEMENT_MS && attempt > 1 )); then
-                log "INFO" "跳过候选 [$best_node]：延迟改善不足 ${LATENCY_FAILOVER_IMPROVEMENT_MS}ms"
+        if [[ "$best_score" =~ ^[0-9]+$ ]]; then
+            if (( current_score - best_score < LATENCY_FAILOVER_IMPROVEMENT_MS && attempt > 1 )); then
+                log "INFO" "跳过候选 [$best_node]：综合改善不足 ${LATENCY_FAILOVER_IMPROVEMENT_MS}"
                 continue
             fi
         fi
 
-        log "INFO" "🔍 尝试节点 [$best_node] delay=${best_delay}ms score=${best_score} (${attempt}/${MAX_SWITCH_ATTEMPTS})"
+        log "INFO" "🔍 尝试节点 [$best_node] telegram=${telegram_ms}ms openai=${openai_ms}ms anthropic=${anthropic_ms}ms score=${best_score} (${attempt}/${MAX_SWITCH_ATTEMPTS})"
 
         if ! switch_node "$best_node"; then
             quarantine_node "$best_node"
@@ -937,7 +1003,7 @@ smart_switch() {
         if [[ $fault_type -eq 0 ]]; then
             log "INFO" "✅ 切换成功: $best_node"
             reset_failure_count
-            send_alert "恢复通知" "✅ VPN 恢复\n新节点: $best_node\n延迟: ${best_delay}ms\n尝试次数: $attempt"
+            send_alert "恢复通知" "✅ VPN 恢复\n新节点: $best_node\nTelegram: ${telegram_ms}ms\nOpenAI: ${openai_ms}ms\nAnthropic: ${anthropic_ms}ms\n尝试次数: $attempt"
             return 0
         fi
 
@@ -1005,6 +1071,19 @@ main() {
         exit 1
     }
     log "INFO" "当前节点: $current_node"
+
+    if is_hk_node "$current_node"; then
+        log "WARN" "⚠️ 当前节点命中香港，按策略立即切换"
+        _bump_daily_fault "vpn"
+        if smart_switch "$current_node"; then
+            _bump_daily_stat "switches"
+            log "INFO" "========== 完成：香港节点已切换 =========="
+            exit 0
+        else
+            log "ERROR" "========== 完成：香港节点切换失败 =========="
+            exit 1
+        fi
+    fi
 
     local fault_type=0
     if classify_fault; then
