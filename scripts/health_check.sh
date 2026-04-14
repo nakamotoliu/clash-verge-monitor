@@ -81,9 +81,13 @@ readonly HTTP_CODE_MAX=499
 DRY_RUN=false
 RESET_MODE=false
 STATS_MODE=false
-[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
-[[ "${1:-}" == "--reset" ]] && RESET_MODE=true
-[[ "${1:-}" == "--stats" ]] && STATS_MODE=true
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=true ;;
+        --reset) RESET_MODE=true ;;
+        --stats) STATS_MODE=true ;;
+    esac
+done
 
 # ==================== 初始化 ====================
 init() {
@@ -220,6 +224,24 @@ log() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[${timestamp}] [${level}] ${message}" | tee -a "$LOG_FILE"
+}
+
+has_duplicate_process() {
+    local self_pid parent_pid script_path count
+    self_pid=$$
+    parent_pid=$PPID
+    script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+    count=$(ps -axo pid=,ppid=,command= | awk -v self="$self_pid" -v parent="$parent_pid" -v path="$script_path" '
+        index($0, path) > 0 {
+            pid=$1
+            ppid=$2
+            if (pid != self && pid != parent) count++
+        }
+        END { print count+0 }
+    ')
+
+    (( count > 0 ))
 }
 
 send_telegram() {
@@ -700,7 +722,7 @@ check_url_via_proxy_timed() {
 
 score_candidate_node() {
     local node="$1"
-    local selector_encoded old_node switched=false
+    local selector_encoded old_node switched=false restored=false
     local telegram_ms openai_ms anthropic_ms
     local code result score=0
 
@@ -710,12 +732,29 @@ score_candidate_node() {
     old_node=$(get_current_node || true)
     [[ -z "$old_node" ]] && return 1
 
+    restore_original_node() {
+        if [[ "$switched" == true && "$restored" == false && -n "$old_node" && "$old_node" != "$node" ]]; then
+            clash_api "PUT" "/proxies/$selector_encoded" "{\"name\":\"$old_node\"}" >/dev/null || true
+            sleep 1
+            restored=true
+        fi
+    }
+
+    trap restore_original_node RETURN
+
     if [[ "$old_node" != "$node" ]]; then
         if ! clash_api "PUT" "/proxies/$selector_encoded" "{\"name\":\"$node\"}" >/dev/null; then
             return 1
         fi
-        switched=true
         sleep "$SWITCH_WAIT"
+
+        local now_node
+        now_node=$(get_current_node || true)
+        if [[ "$now_node" != "$node" ]]; then
+            log "WARN" "候选评分切换未生效，跳过节点: $node (current=${now_node:-unknown})"
+            return 1
+        fi
+        switched=true
     fi
 
     result=$(check_url_via_proxy_timed "$CANARY_TELEGRAM" "$TIMEOUT_API" || true)
@@ -732,11 +771,6 @@ score_candidate_node() {
 
     score=$((telegram_ms + openai_ms + anthropic_ms))
     echo -e "${node}\t${telegram_ms}\t${openai_ms}\t${anthropic_ms}\t${score}"
-
-    if [[ "$switched" == true && -n "$old_node" && "$old_node" != "$node" ]]; then
-        clash_api "PUT" "/proxies/$selector_encoded" "{\"name\":\"$old_node\"}" >/dev/null || true
-        sleep 1
-    fi
 }
 
 # ==================== 故障分类 ====================
@@ -875,147 +909,87 @@ classify_fault() {
     return 0
 }
 
-# ==================== 候选评分与选择 ====================
-# 输出："node<TAB>telegram_ms<TAB>openai_ms<TAB>anthropic_ms<TAB>score"
-rank_candidates() {
+# ==================== 候选选择 ====================
+choose_next_candidate() {
     local current_node="$1"
-    local -a nodes=()
-    local node
+    local node count=0
 
     while IFS= read -r node; do
-        [[ -n "$node" ]] && nodes+=("$node")
-    done < <(get_available_nodes || true)
-
-    if (( ${#nodes[@]} == 0 )); then
-        log "WARN" "候选节点列表为空（selector=$SELECTOR，current=$current_node）"
-        return 0
-    fi
-
-    for node in "${nodes[@]}"; do
         [[ -z "$node" ]] && continue
         [[ "$node" == "$current_node" ]] && continue
-
-        # 隔离中的直接跳过
-        if is_node_quarantined "$node"; then
-            continue
+        is_node_quarantined "$node" && continue
+        is_candidate_allowed "$node" || continue
+        printf '%s\n' "$node"
+        count=$((count + 1))
+        if (( count >= MAX_SWITCH_ATTEMPTS )); then
+            break
         fi
-
-        score_candidate_node "$node" || true
-    done | sort -t$'\t' -k5,5n
+    done < <(get_available_nodes || true)
 }
 
 # 正常态重平衡（防抖）：
-# - 不在每次检查都切
-# - 最小驻留时间未到不切
-# - 改善幅度不够不切
+# 只做记录，不在健康状态下主动来回切候选
 maybe_rebalance_when_healthy() {
     local current_node="$1"
-    local ok_count last_switch_at now dwell best_line best_node best_score current_line current_score improvement
+    local ok_count last_switch_at now dwell candidate
 
     ok_count=$(get_state_value "health_ok_count")
     [[ -z "$ok_count" || "$ok_count" == "null" ]] && ok_count=0
 
-    # 不是每轮都做延迟重平衡，降低扰动
     if (( ok_count % REBALANCE_CHECK_INTERVAL != 0 )); then
         log "DEBUG" "跳过重平衡检查（health_ok_count=$ok_count）"
         return 0
     fi
 
-    current_line=$(score_candidate_node "$current_node" || true)
-    [[ -z "$current_line" ]] && return 0
-    current_score=$(echo "$current_line" | awk -F'\t' '{print $5}')
-
-    best_line=$(rank_candidates "$current_node" | head -1 || true)
-    [[ -z "$best_line" ]] && return 0
-
-    best_node=$(echo "$best_line" | awk -F'\t' '{print $1}')
-    best_score=$(echo "$best_line" | awk -F'\t' '{print $5}')
-    improvement=$((current_score - best_score))
     last_switch_at=$(get_state_value "last_switch_at")
     [[ -z "$last_switch_at" || "$last_switch_at" == "null" ]] && last_switch_at=0
     now=$(date +%s)
     dwell=$((now - last_switch_at))
-
-    log "INFO" "重平衡评估: current=${current_node}(score=${current_score}), best=${best_node}(score=${best_score}), improvement=${improvement}, dwell=${dwell}s"
 
     if (( dwell < MIN_NODE_DWELL_SECONDS )); then
         log "INFO" "防抖: 驻留未满 ${MIN_NODE_DWELL_SECONDS}s，不切换"
         return 0
     fi
 
-    if (( improvement < LATENCY_REBALANCE_IMPROVEMENT_MS )); then
-        log "INFO" "防抖: 改善不足 ${LATENCY_REBALANCE_IMPROVEMENT_MS}，不切换"
+    candidate=$(choose_next_candidate "$current_node" | head -1 || true)
+    if [[ -z "$candidate" ]]; then
+        log "DEBUG" "无可用候选节点，跳过重平衡"
         return 0
     fi
 
-    log "WARN" "⚖️ 触发重平衡切换: $current_node(score=${current_score}) -> $best_node(score=${best_score})"
-    if switch_node "$best_node"; then
-        send_alert "节点重平衡" "⚖️ 节点重平衡\n$current_node(score=${current_score}) → $best_node(score=${best_score})\n改善 ${improvement}"
-    fi
+    log "INFO" "重平衡候选观察: current=${current_node}, candidate=${candidate}, dwell=${dwell}s（保守模式，不在健康态主动切换）"
 }
 
-# ==================== 故障切换（按 Telegram/OpenAI/Anthropic 加权评分） ====================
+# ==================== 故障切换（保守模式：一轮最多切一次） ====================
 smart_switch() {
     local current_node="$1"
-    local current_line current_score best_node telegram_ms openai_ms anthropic_ms best_score attempt=0
+    local best_node attempt=0
 
-    current_line=$(score_candidate_node "$current_node" || true)
-    current_score=$(echo "$current_line" | awk -F'\t' '{print $5}')
-    [[ -z "$current_score" ]] && current_score=99999
-
-    log "WARN" "⚠️ 当前节点 [$current_node] 故障，开始智能切换..."
-    send_alert "节点故障" "⚠️ VPN 节点故障\n当前: $current_node\n开始智能切换（Telegram/OpenAI/Anthropic 评分）"
+    log "WARN" "⚠️ 当前节点 [$current_node] 故障，开始保守切换..."
+    send_alert "节点故障" "⚠️ VPN 节点故障\n当前: $current_node\n开始保守切换（本轮最多切一次）"
 
     cleanup_quarantine
     quarantine_node "$current_node"
 
-    while IFS=$'\t' read -r best_node telegram_ms openai_ms anthropic_ms best_score; do
-        [[ -z "${best_node:-}" ]] && continue
-        ((attempt++))
+    while IFS= read -r best_node; do
+        [[ -z "$best_node" ]] && continue
+        attempt=$((attempt + 1))
         if (( attempt > MAX_SWITCH_ATTEMPTS )); then
             break
         fi
 
-        if [[ "$best_score" =~ ^[0-9]+$ ]]; then
-            if (( current_score - best_score < LATENCY_FAILOVER_IMPROVEMENT_MS && attempt > 1 )); then
-                log "INFO" "跳过候选 [$best_node]：综合改善不足 ${LATENCY_FAILOVER_IMPROVEMENT_MS}"
-                continue
-            fi
-        fi
-
-        log "INFO" "🔍 尝试节点 [$best_node] telegram=${telegram_ms}ms openai=${openai_ms}ms anthropic=${anthropic_ms}ms score=${best_score} (${attempt}/${MAX_SWITCH_ATTEMPTS})"
+        log "INFO" "🔍 选择候选节点 [$best_node] (${attempt}/${MAX_SWITCH_ATTEMPTS})"
 
         if ! switch_node "$best_node"; then
             quarantine_node "$best_node"
             continue
         fi
 
-        sleep "$STABILIZE_WAIT"
-
-        # 切过去后重新判定故障类型
-        local fault_type
-        if classify_fault; then
-            fault_type=0
-        else
-            fault_type=$?
-        fi
-
-        if [[ $fault_type -eq 0 ]]; then
-            log "INFO" "✅ 切换成功: $best_node"
-            reset_failure_count
-            send_alert "恢复通知" "✅ VPN 恢复\n新节点: $best_node\nTelegram: ${telegram_ms}ms\nOpenAI: ${openai_ms}ms\nAnthropic: ${anthropic_ms}ms\n尝试次数: $attempt"
-            return 0
-        fi
-
-        if [[ $fault_type -eq 2 || $fault_type -eq 3 || $fault_type -eq 4 ]]; then
-            log "WARN" "检测到非节点级故障（type=$fault_type），停止继续切换"
-            record_global_failure
-            return 1
-        fi
-
-        log "WARN" "❌ 节点 [$best_node] 仍不可用，加入隔离"
-        quarantine_node "$best_node"
-    done < <(rank_candidates "$current_node")
+        log "INFO" "✅ 已切换到候选节点: $best_node（保守模式，本轮不继续测速，等待下次运行验证）"
+        reset_failure_count
+        send_alert "节点已切换" "✅ 已切换节点\n$current_node → $best_node\n本轮停止继续测试，等待下一次健康检查验证"
+        return 0
+    done < <(choose_next_candidate "$current_node")
 
     log "ERROR" "❌ 未找到可用节点（已尝试 $attempt 个）"
     record_global_failure
@@ -1045,6 +1019,14 @@ main() {
     init
     check_dependencies
     load_ui_config
+
+    # 先做进程级去重，再拿 lock
+    if has_duplicate_process; then
+        _rotate_log
+        log "WARN" "检测到重复的 health_check.sh 进程，跳过本次运行"
+        exit 0
+    fi
+
     acquire_lock
 
     # 每次运行前检查日志轮转
