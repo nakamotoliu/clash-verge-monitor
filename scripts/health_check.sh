@@ -227,21 +227,19 @@ log() {
 }
 
 has_duplicate_process() {
-    local self_pid parent_pid script_path count
-    self_pid=$$
-    parent_pid=$PPID
-    script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    local lock_pid
 
-    count=$(ps -axo pid=,ppid=,command= | awk -v self="$self_pid" -v parent="$parent_pid" -v path="$script_path" '
-        index($0, path) > 0 {
-            pid=$1
-            ppid=$2
-            if (pid != self && pid != parent) count++
-        }
-        END { print count+0 }
-    ')
+    [[ -f "$LOCK_FILE" ]] || return 1
+    lock_pid=$(cat "$LOCK_FILE" 2>/dev/null || true)
+    [[ "$lock_pid" =~ ^[0-9]+$ ]] || return 1
+    [[ "$lock_pid" == "$$" ]] && return 1
 
-    (( count > 0 ))
+    if kill -0 "$lock_pid" 2>/dev/null; then
+        return 0
+    fi
+
+    rm -f "$LOCK_FILE"
+    return 1
 }
 
 send_telegram() {
